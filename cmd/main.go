@@ -28,8 +28,8 @@ func main() {
 	pinPath := flag.String("pin-path", "/sys/fs/bpf/ebpf-test", "bpffs directory for pinned maps")
 	markName := flag.String("mark-name", "firefox", "comma-separated process identity substrings matched by the default check callback")
 	markValue := flag.Uint64("mark-value", defaultMarkValue, "mark value assigned by the default check callback")
+	fwmarkValue := flag.String("fmark-value", "", "fwmark format value to derive full mark from; overwrites mark-value")
 	markPriority := flag.Int("mark-priority", 0, "signed int8 priority assigned by the default check callback; higher priority wins")
-	filesPriority := flag.Int("files-priority", 1, "signed int8 priority assigned by the files integration; higher priority wins")
 	httpAddr := flag.String("http-addr", "127.0.0.1:8050", "daemon HTTP control listen address")
 	watcher := flag.Bool("watcher", false, "watch the pinned process map instead of running the daemon")
 	watchInterval := flag.Duration("watch-interval", time.Second, "interval for watcher refreshes")
@@ -37,10 +37,16 @@ func main() {
 	if *markPriority < -128 || *markPriority > 127 {
 		log.Fatalf("mark-priority must be between -128 and 127, got %d", *markPriority)
 	}
-	if *filesPriority < -128 || *filesPriority > 127 {
-		log.Fatalf("files-priority must be between -128 and 127, got %d", *filesPriority)
-	}
 	priority := int8(*markPriority)
+
+	if *fwmarkValue != "" {
+		fwm, err := fwmark.Parse(*fwmarkValue)
+		if err != nil {
+			log.Fatalf("Failed to parse fwmark: %v", fwmarkValue)
+		}
+		mark := fwmark.ToMark(fwm)
+		markValue = &mark
+	}
 
 	if *watcher {
 		if err := runWatcher(*pinPath, *watchInterval); err != nil {

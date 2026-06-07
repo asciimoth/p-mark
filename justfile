@@ -15,3 +15,6 @@ daemon: build
 
 watcher: build
   sudo ./pmark -watcher
+
+help: build
+  ./pmark --help
