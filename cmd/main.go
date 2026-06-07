@@ -400,11 +400,14 @@ func printWatcherNode(
 	}
 	seen[proc.Key.Tgid] = true
 
-	branch := "`-"
-	childPrefix := prefix + "  "
+	branch := "└"
+	if prefix == "" {
+		branch = ""
+	}
+	childPrefix := prefix + " "
 	if !last {
-		branch = "|-"
-		childPrefix = prefix + "| "
+		branch = "├"
+		childPrefix = prefix + "│"
 	}
 
 	value := active[proc.Key]
