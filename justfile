@@ -11,7 +11,7 @@ build: generate
   go build -o ./pmark ./cmd
 
 daemon: build
-  sudo ./pmark -fwmark -mark-name firefox
+  sudo ./pmark -fwmark -rule-comm firefox
 
 watcher: build
   sudo ./pmark -watcher

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,7 +27,10 @@ const defaultMarkValue = 0xeb9f000100000001
 
 func main() {
 	pinPath := flag.String("pin-path", "/sys/fs/bpf/ebpf-test", "bpffs directory for pinned maps")
-	markName := flag.String("mark-name", "firefox", "comma-separated process identity substrings matched by the default check callback")
+	ruleComm := flag.String("rule-comm", "firefox", "comma-separated regexps matched against comm by the default check callback")
+	ruleCmd := flag.String("rule-cmd", "", "comma-separated regexps matched against cmdline by the default check callback")
+	ruleExe := flag.String("rule-exe", "", "comma-separated regexps matched against exe and exe basename by the default check callback")
+	rulePPID := flag.String("rule-ppid", "", "comma-separated parent process ids matched by the default check callback")
 	markValue := flag.Uint64("mark-value", defaultMarkValue, "mark value assigned by the default check callback")
 	fwmarkValue := flag.String("fmark-value", "", "fwmark format value to derive full mark from; overwrites mark-value")
 	enableFWMark := flag.Bool("fwmark", false, "enable Linux fwmark socket marking with fwmark eBPF hooks in daemon mode")
@@ -65,7 +69,16 @@ func main() {
 		log.Printf("Drop marked traffic: %s", fwmarkDropCommand(currentFWMark))
 	}
 
-	nameCheck := defaultCheck(*markName, priority, *markValue)
+	checkRules := defaultCheckRules{
+		RuleComm: *ruleComm,
+		RuleCmd:  *ruleCmd,
+		RuleExe:  *ruleExe,
+		RulePPID: *rulePPID,
+	}
+	nameCheck, err := defaultCheck(checkRules, priority, *markValue)
+	if err != nil {
+		log.Fatal("Creating default checker:", err)
+	}
 	daemon, err := core.NewDaemon(*pinPath, core.Callbacks{
 		Check:         nameCheck,
 		ProcessEvent:  logProcessEvent,
@@ -104,7 +117,7 @@ func main() {
 	log.Printf("Pinned maps under %s", *pinPath)
 	log.Print("Listening for process fork/exec/exit events. Press Ctrl-C to stop.")
 
-	control, err := startDaemonControlServer(*httpAddr, daemon, *markName, priority, *markValue)
+	control, err := startDaemonControlServer(*httpAddr, daemon, checkRules, priority, *markValue)
 	if err != nil {
 		log.Fatal("Starting daemon HTTP control server:", err)
 	}
@@ -131,24 +144,33 @@ type daemonControlServer struct {
 	server *http.Server
 }
 
-func startDaemonControlServer(addr string, daemon *core.Daemon, currentMarkName string, defaultMarkPriority int8, defaultMarkValue uint64) (*daemonControlServer, error) {
+func startDaemonControlServer(addr string, daemon *core.Daemon, currentRules defaultCheckRules, defaultMarkPriority int8, defaultMarkValue uint64) (*daemonControlServer, error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
 	var controlMu sync.Mutex
-	nameCheck := defaultCheck(currentMarkName, defaultMarkPriority, defaultMarkValue)
+	nameCheck, err := defaultCheck(currentRules, defaultMarkPriority, defaultMarkValue)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /mark-name", func(w http.ResponseWriter, r *http.Request) {
-		update, err := parseMarkNameUpdate(r, defaultMarkPriority, defaultMarkValue)
+	handleRuleUpdate := func(w http.ResponseWriter, r *http.Request) {
+		update, err := parseDefaultCheckUpdate(r, defaultMarkPriority, defaultMarkValue)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		nextCheck, err := defaultCheck(update.Rules, update.MarkPriority, update.MarkValue)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		controlMu.Lock()
-		nameCheck = defaultCheck(update.MarkName, update.MarkPriority, update.MarkValue)
+		nameCheck = nextCheck
 		_, err = daemon.SetChecker(nameCheck)
 		controlMu.Unlock()
 		if err != nil {
@@ -160,7 +182,9 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, currentMarkName 
 		if err := json.NewEncoder(w).Encode(update); err != nil {
 			log.Printf("writing HTTP response: %v", err)
 		}
-	})
+	}
+	mux.HandleFunc("POST /rules", handleRuleUpdate)
+	mux.HandleFunc("POST /mark-name", handleRuleUpdate)
 
 	server := &http.Server{
 		Handler:           mux,
@@ -170,7 +194,14 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, currentMarkName 
 
 	controlURL := httpControlURL(listener.Addr().String())
 	log.Printf("Daemon HTTP control listening on %s", controlURL)
-	log.Printf("Update checker: curl -X POST -d 'mark_name=%s' %s/mark-name", shellSingleQuoteValue(currentMarkName), controlURL)
+	log.Printf(
+		"Update checker: curl -X POST -d 'rule_comm=%s' -d 'rule_cmd=%s' -d 'rule_exe=%s' -d 'rule_ppid=%s' %s/rules",
+		shellSingleQuoteValue(currentRules.RuleComm),
+		shellSingleQuoteValue(currentRules.RuleCmd),
+		shellSingleQuoteValue(currentRules.RuleExe),
+		shellSingleQuoteValue(currentRules.RulePPID),
+		controlURL,
+	)
 
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -192,40 +223,57 @@ func (s *daemonControlServer) shutdown() {
 	}
 }
 
-type markNameUpdate struct {
-	MarkName     string `json:"mark_name"`
-	MarkPriority int8   `json:"mark_priority"`
-	MarkValue    uint64 `json:"mark_value"`
+type defaultCheckRules struct {
+	RuleComm string `json:"rule_comm"`
+	RuleCmd  string `json:"rule_cmd"`
+	RuleExe  string `json:"rule_exe"`
+	RulePPID string `json:"rule_ppid"`
 }
 
-func parseMarkNameUpdate(r *http.Request, defaultMarkPriority int8, defaultMarkValue uint64) (markNameUpdate, error) {
-	update := markNameUpdate{MarkPriority: defaultMarkPriority, MarkValue: defaultMarkValue}
+type defaultCheckUpdate struct {
+	defaultCheckRules
+	Rules        defaultCheckRules `json:"-"`
+	MarkPriority int8              `json:"mark_priority"`
+	MarkValue    uint64            `json:"mark_value"`
+}
+
+func parseDefaultCheckUpdate(r *http.Request, defaultMarkPriority int8, defaultMarkValue uint64) (defaultCheckUpdate, error) {
+	update := defaultCheckUpdate{MarkPriority: defaultMarkPriority, MarkValue: defaultMarkValue}
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-			return markNameUpdate{}, fmt.Errorf("decode JSON body: %w", err)
+			return defaultCheckUpdate{}, fmt.Errorf("decode JSON body: %w", err)
 		}
 	} else {
 		if err := r.ParseForm(); err != nil {
-			return markNameUpdate{}, fmt.Errorf("parse form body: %w", err)
+			return defaultCheckUpdate{}, fmt.Errorf("parse form body: %w", err)
 		}
-		update.MarkName = r.Form.Get("mark_name")
+		update.RuleComm = r.Form.Get("rule_comm")
+		update.RuleCmd = r.Form.Get("rule_cmd")
+		update.RuleExe = r.Form.Get("rule_exe")
+		update.RulePPID = r.Form.Get("rule_ppid")
 		if raw := r.Form.Get("mark_value"); raw != "" {
 			markValue, err := strconv.ParseUint(raw, 10, 64)
 			if err != nil {
-				return markNameUpdate{}, fmt.Errorf("parse mark_value: %w", err)
+				return defaultCheckUpdate{}, fmt.Errorf("parse mark_value: %w", err)
 			}
 			update.MarkValue = markValue
 		}
 		if raw := r.Form.Get("mark_priority"); raw != "" {
 			markPriority, err := strconv.ParseInt(raw, 10, 8)
 			if err != nil {
-				return markNameUpdate{}, fmt.Errorf("parse mark_priority: %w", err)
+				return defaultCheckUpdate{}, fmt.Errorf("parse mark_priority: %w", err)
 			}
 			update.MarkPriority = int8(markPriority)
 		}
 	}
 
-	update.MarkName = strings.TrimSpace(update.MarkName)
+	update.Rules = defaultCheckRules{
+		RuleComm: strings.TrimSpace(update.RuleComm),
+		RuleCmd:  strings.TrimSpace(update.RuleCmd),
+		RuleExe:  strings.TrimSpace(update.RuleExe),
+		RulePPID: strings.TrimSpace(update.RulePPID),
+	}
+	update.defaultCheckRules = update.Rules
 	return update, nil
 }
 
@@ -457,70 +505,118 @@ func activeWatcherChildren(
 	return children
 }
 
-func defaultCheck(markName string, markPriority int8, markValue uint64) core.CheckFunc {
-	markNames := parseMarkNames(markName)
+func defaultCheck(rules defaultCheckRules, markPriority int8, markValue uint64) (core.CheckFunc, error) {
+	matcher, err := compileDefaultCheckRules(rules)
+	if err != nil {
+		return nil, err
+	}
 	return func(info core.ProcessInfo) (int8, uint64, bool) {
-		if len(markNames) == 0 {
+		if !matcher.hasRules() {
 			return 0, 0, false
 		}
-		return markPriority, markValue, processIdentityMatches(info, markNames)
-	}
+		return markPriority, markValue, matcher.matches(info)
+	}, nil
 }
 
-func parseMarkNames(markName string) []string {
-	parts := strings.Split(markName, ",")
-	out := make([]string, 0, len(parts))
+type defaultCheckMatcher struct {
+	comm []*regexp.Regexp
+	cmd  []*regexp.Regexp
+	exe  []*regexp.Regexp
+	ppid map[uint32]bool
+}
+
+func compileDefaultCheckRules(rules defaultCheckRules) (defaultCheckMatcher, error) {
+	comm, err := compileRegexpList("rule_comm", rules.RuleComm)
+	if err != nil {
+		return defaultCheckMatcher{}, err
+	}
+	cmd, err := compileRegexpList("rule_cmd", rules.RuleCmd)
+	if err != nil {
+		return defaultCheckMatcher{}, err
+	}
+	exe, err := compileRegexpList("rule_exe", rules.RuleExe)
+	if err != nil {
+		return defaultCheckMatcher{}, err
+	}
+	ppid, err := parsePPIDRules(rules.RulePPID)
+	if err != nil {
+		return defaultCheckMatcher{}, err
+	}
+	return defaultCheckMatcher{
+		comm: comm,
+		cmd:  cmd,
+		exe:  exe,
+		ppid: ppid,
+	}, nil
+}
+
+func compileRegexpList(name, value string) ([]*regexp.Regexp, error) {
+	parts := strings.Split(value, ",")
+	out := make([]*regexp.Regexp, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
-
-func processIdentityMatches(info core.ProcessInfo, needles []string) bool {
-	identity := []string{
-		info.Comm,
-		firstCmdlineField(info.Cmdline),
-		info.Exe,
-		filepath.Base(info.Exe),
-	}
-	pid := strconv.FormatUint(uint64(info.Key.Tgid), 10)
-	for _, needle := range needles {
-		if needle == pid {
-			return true
-		}
-		if isDecimal(needle) {
+		if part == "" {
 			continue
 		}
-		for _, value := range identity {
-			if value != "" && strings.Contains(value, needle) {
-				return true
-			}
+		re, err := regexp.Compile(part)
+		if err != nil {
+			return nil, fmt.Errorf("compile %s %q: %w", name, part, err)
 		}
+		out = append(out, re)
+	}
+	return out, nil
+}
+
+func parsePPIDRules(value string) (map[uint32]bool, error) {
+	parts := strings.Split(value, ",")
+	out := make(map[uint32]bool)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ppid, err := strconv.ParseUint(part, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parse rule_ppid %q: %w", part, err)
+		}
+		out[uint32(ppid)] = true
+	}
+	return out, nil
+}
+
+func (m defaultCheckMatcher) hasRules() bool {
+	return len(m.comm) > 0 || len(m.cmd) > 0 || len(m.exe) > 0 || len(m.ppid) > 0
+}
+
+func (m defaultCheckMatcher) matches(info core.ProcessInfo) bool {
+	if m.ppid[info.PPID] {
+		return true
+	}
+	if anyRegexpMatches(m.comm, info.Comm) {
+		return true
+	}
+	if anyRegexpMatches(m.cmd, info.Cmdline) {
+		return true
+	}
+	if anyRegexpMatches(m.exe, info.Exe) {
+		return true
+	}
+	if anyRegexpMatches(m.exe, filepath.Base(info.Exe)) {
+		return true
 	}
 	return false
 }
 
-func isDecimal(value string) bool {
+func anyRegexpMatches(regexps []*regexp.Regexp, value string) bool {
 	if value == "" {
 		return false
 	}
-	for _, r := range value {
-		if r < '0' || r > '9' {
-			return false
+	for _, re := range regexps {
+		if re.MatchString(value) {
+			return true
 		}
 	}
-	return true
-}
-
-func firstCmdlineField(cmdline string) string {
-	fields := strings.Fields(cmdline)
-	if len(fields) == 0 {
-		return ""
-	}
-	return fields[0]
+	return false
 }
 
 func logProcessEvent(event core.ProcessEvent) {
