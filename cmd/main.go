@@ -30,7 +30,7 @@ const defaultMarkValue = 0xeb9f000100000001
 var adminHTML string
 
 func main() {
-	pinPath := flag.String("pin-path", "/sys/fs/bpf/ebpf-test", "bpffs directory for pinned maps")
+	pinPath := flag.String("pin-path", "/sys/fs/bpf/pmark", "bpffs directory for pinned maps")
 	ruleComm := flag.String("rule-comm", "firefox", "comma-separated regexps matched against comm by the default check callback")
 	ruleCmd := flag.String("rule-cmd", "", "comma-separated regexps matched against cmdline by the default check callback")
 	ruleExe := flag.String("rule-exe", "", "comma-separated regexps matched against exe and exe basename by the default check callback")
