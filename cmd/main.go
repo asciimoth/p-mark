@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,9 @@ import (
 )
 
 const defaultMarkValue = 0xeb9f000100000001
+
+//go:embed admin.html
+var adminHTML string
 
 func main() {
 	pinPath := flag.String("pin-path", "/sys/fs/bpf/ebpf-test", "bpffs directory for pinned maps")
@@ -117,7 +121,14 @@ func main() {
 	log.Printf("Pinned maps under %s", *pinPath)
 	log.Print("Listening for process fork/exec/exit events. Press Ctrl-C to stop.")
 
-	control, err := startDaemonControlServer(*httpAddr, daemon, checkRules, priority, *markValue)
+	control, err := startDaemonControlServer(*httpAddr, daemon, daemonControlConfig{
+		PinPath:       *pinPath,
+		HTTPAddr:      *httpAddr,
+		FWMarkEnabled: *enableFWMark,
+		Rules:         checkRules,
+		MarkPriority:  priority,
+		MarkValue:     *markValue,
+	})
 	if err != nil {
 		log.Fatal("Starting daemon HTTP control server:", err)
 	}
@@ -144,22 +155,61 @@ type daemonControlServer struct {
 	server *http.Server
 }
 
-func startDaemonControlServer(addr string, daemon *core.Daemon, currentRules defaultCheckRules, defaultMarkPriority int8, defaultMarkValue uint64) (*daemonControlServer, error) {
+type daemonControlConfig struct {
+	PinPath       string            `json:"pin_path"`
+	HTTPAddr      string            `json:"http_addr"`
+	FWMarkEnabled bool              `json:"fwmark_enabled"`
+	Rules         defaultCheckRules `json:"rules"`
+	MarkPriority  int8              `json:"mark_priority"`
+	MarkValue     uint64            `json:"mark_value,string"`
+}
+
+func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonControlConfig) (*daemonControlServer, error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	config.HTTPAddr = listener.Addr().String()
 
 	var controlMu sync.Mutex
-	nameCheck, err := defaultCheck(currentRules, defaultMarkPriority, defaultMarkValue)
+	nameCheck, err := defaultCheck(config.Rules, config.MarkPriority, config.MarkValue)
 	if err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(adminHTML))
+	})
+	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {
+		controlMu.Lock()
+		stateConfig := config
+		controlMu.Unlock()
+
+		state, err := daemonControlState(daemon, stateConfig)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(state); err != nil {
+			log.Printf("writing HTTP response: %v", err)
+		}
+	})
 	handleRuleUpdate := func(w http.ResponseWriter, r *http.Request) {
-		update, err := parseDefaultCheckUpdate(r, defaultMarkPriority, defaultMarkValue)
+		controlMu.Lock()
+		currentMarkPriority := config.MarkPriority
+		currentMarkValue := config.MarkValue
+		controlMu.Unlock()
+
+		update, err := parseDefaultCheckUpdate(r, currentMarkPriority, currentMarkValue)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -172,6 +222,11 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, currentRules def
 		controlMu.Lock()
 		nameCheck = nextCheck
 		_, err = daemon.SetChecker(nameCheck)
+		if err == nil {
+			config.Rules = update.Rules
+			config.MarkPriority = update.MarkPriority
+			config.MarkValue = update.MarkValue
+		}
 		controlMu.Unlock()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -196,10 +251,10 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, currentRules def
 	log.Printf("Daemon HTTP control listening on %s", controlURL)
 	log.Printf(
 		"Update checker: curl -X POST -d 'rule_comm=%s' -d 'rule_cmd=%s' -d 'rule_exe=%s' -d 'rule_ppid=%s' %s/rules",
-		shellSingleQuoteValue(currentRules.RuleComm),
-		shellSingleQuoteValue(currentRules.RuleCmd),
-		shellSingleQuoteValue(currentRules.RuleExe),
-		shellSingleQuoteValue(currentRules.RulePPID),
+		shellSingleQuoteValue(config.Rules.RuleComm),
+		shellSingleQuoteValue(config.Rules.RuleCmd),
+		shellSingleQuoteValue(config.Rules.RuleExe),
+		shellSingleQuoteValue(config.Rules.RulePPID),
 		controlURL,
 	)
 
@@ -210,6 +265,57 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, currentRules def
 	}()
 
 	return control, nil
+}
+
+func daemonControlState(daemon *core.Daemon, config daemonControlConfig) (jsonDaemonState, error) {
+	snapshot, err := core.GrabProcessMapState(config.PinPath)
+	if err != nil {
+		return jsonDaemonState{}, err
+	}
+
+	entries := make([]jsonProcessMapEntry, 0, len(snapshot.Entries))
+	for key, value := range snapshot.Entries {
+		entries = append(entries, jsonProcessMapEntry{
+			Key:   jsonKey(key),
+			Value: jsonValue(value),
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Key.TGID != entries[j].Key.TGID {
+			return entries[i].Key.TGID < entries[j].Key.TGID
+		}
+		return entries[i].Key.StartTime < entries[j].Key.StartTime
+	})
+
+	procs := make([]jsonObservedProcess, 0, len(snapshot.Procs))
+	for _, proc := range snapshot.Procs {
+		procs = append(procs, jsonObservedProcess{
+			Key:  jsonKey(proc.Key),
+			Info: jsonProc(proc),
+		})
+	}
+	sort.Slice(procs, func(i, j int) bool {
+		if procs[i].Key.TGID != procs[j].Key.TGID {
+			return procs[i].Key.TGID < procs[j].Key.TGID
+		}
+		return procs[i].Key.StartTime < procs[j].Key.StartTime
+	})
+
+	return jsonDaemonState{
+		Type:        "daemon_state",
+		RefreshedAt: time.Now().Format(time.RFC3339),
+		Config:      config,
+		Dynamic: jsonDaemonDynamicState{
+			Generation: daemon.CurrentGeneration(),
+			ProcessMap: jsonProcessMapState{
+				Alive:      snapshot.Alive,
+				Tombstones: snapshot.Tombstones,
+				Latest:     snapshot.Latest,
+				Entries:    entries,
+			},
+			Processes: procs,
+		},
+	}, nil
 }
 
 func (s *daemonControlServer) shutdown() {

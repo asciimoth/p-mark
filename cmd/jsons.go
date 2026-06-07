@@ -43,3 +43,33 @@ type jsonProcessUpdate struct {
 	Key   jsonProcessKey   `json:"key"`
 	Value jsonProcessValue `json:"value"`
 }
+
+type jsonDaemonState struct {
+	Type        string                 `json:"type"`
+	RefreshedAt string                 `json:"refreshed_at"`
+	Config      daemonControlConfig    `json:"config"`
+	Dynamic     jsonDaemonDynamicState `json:"dynamic"`
+}
+
+type jsonDaemonDynamicState struct {
+	Generation uint64                `json:"generation"`
+	ProcessMap jsonProcessMapState   `json:"process_map"`
+	Processes  []jsonObservedProcess `json:"processes"`
+}
+
+type jsonProcessMapState struct {
+	Alive      int                   `json:"alive"`
+	Tombstones int                   `json:"tombstones"`
+	Latest     uint64                `json:"latest"`
+	Entries    []jsonProcessMapEntry `json:"entries"`
+}
+
+type jsonProcessMapEntry struct {
+	Key   jsonProcessKey   `json:"key"`
+	Value jsonProcessValue `json:"value"`
+}
+
+type jsonObservedProcess struct {
+	Key  jsonProcessKey `json:"key"`
+	Info jsonProcInfo   `json:"info"`
+}

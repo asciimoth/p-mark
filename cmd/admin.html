@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>p-mark admin</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+    body {
+      margin: 0;
+      background: Canvas;
+      color: CanvasText;
+    }
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 26px;
+    }
+    h2 {
+      margin: 24px 0 10px;
+      font-size: 18px;
+    }
+    form {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      padding: 16px;
+      border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+      border-radius: 8px;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    input {
+      min-width: 0;
+      padding: 8px 10px;
+      border: 1px solid color-mix(in srgb, CanvasText 24%, transparent);
+      border-radius: 6px;
+      background: Field;
+      color: FieldText;
+      font: inherit;
+    }
+    button {
+      width: fit-content;
+      padding: 8px 12px;
+      border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+      border-radius: 6px;
+      background: ButtonFace;
+      color: ButtonText;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+    .actions {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .status {
+      color: color-mix(in srgb, CanvasText 70%, transparent);
+      font-size: 13px;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      padding: 12px;
+      border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+      border-radius: 8px;
+    }
+    .metric span {
+      display: block;
+      color: color-mix(in srgb, CanvasText 65%, transparent);
+      font-size: 12px;
+    }
+    .metric strong {
+      display: block;
+      overflow-wrap: anywhere;
+      font-size: 18px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th,
+    td {
+      padding: 8px;
+      border-bottom: 1px solid color-mix(in srgb, CanvasText 14%, transparent);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: color-mix(in srgb, CanvasText 72%, transparent);
+      font-weight: 600;
+    }
+    td {
+      overflow-wrap: anywhere;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .error {
+      color: #b00020;
+    }
+    @media (max-width: 760px) {
+      main {
+        padding: 16px;
+      }
+      header {
+        align-items: start;
+        flex-direction: column;
+      }
+      form,
+      .summary {
+        grid-template-columns: 1fr;
+      }
+      .table-wrap {
+        overflow-x: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>p-mark admin</h1>
+        <div id="refreshed" class="status">Loading state...</div>
+      </div>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+
+    <section class="summary" aria-label="Daemon summary">
+      <div class="metric"><span>Generation</span><strong id="generation">-</strong></div>
+      <div class="metric"><span>Alive entries</span><strong id="alive">-</strong></div>
+      <div class="metric"><span>Tombstones</span><strong id="tombstones">-</strong></div>
+      <div class="metric"><span>Latest update</span><strong id="latest">-</strong></div>
+    </section>
+
+    <h2>Ruleset</h2>
+    <form id="rules">
+      <label>Comm regexps<input name="rule_comm" autocomplete="off"></label>
+      <label>Cmdline regexps<input name="rule_cmd" autocomplete="off"></label>
+      <label>Exe regexps<input name="rule_exe" autocomplete="off"></label>
+      <label>Parent PIDs<input name="rule_ppid" autocomplete="off"></label>
+      <label>Mark priority<input name="mark_priority" type="number" min="-128" max="127"></label>
+      <label>Mark value<input name="mark_value" inputmode="numeric" autocomplete="off"></label>
+      <div class="actions">
+        <button id="save" type="submit">Update ruleset</button>
+        <span id="message" class="status"></span>
+      </div>
+    </form>
+
+    <h2>Configuration</h2>
+    <div class="table-wrap">
+      <table>
+        <tbody id="config"></tbody>
+      </table>
+    </div>
+
+    <h2>Process Map</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>PID</th>
+            <th>Start</th>
+            <th>Mark</th>
+            <th>Priority</th>
+            <th>Generation</th>
+          </tr>
+        </thead>
+        <tbody id="entries"></tbody>
+      </table>
+    </div>
+  </main>
+
+  <script>
+    const form = document.querySelector('#rules');
+    const message = document.querySelector('#message');
+    const save = document.querySelector('#save');
+    const refreshIntervalMS = 3000;
+    let rulesFormDirty = false;
+
+    function text(id, value) {
+      document.querySelector(id).textContent = value;
+    }
+
+    function setMessage(value, isError = false) {
+      message.textContent = value;
+      message.classList.toggle('error', isError);
+    }
+
+    async function loadState() {
+      setMessage('');
+      const response = await fetch('/state', {headers: {'Accept': 'application/json'}});
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const state = await response.json();
+      renderState(state);
+    }
+
+    function renderState(state) {
+      const config = state.config;
+      const dynamic = state.dynamic;
+      const processMap = dynamic.process_map;
+
+      text('#refreshed', `Refreshed ${state.refreshed_at}`);
+      text('#generation', dynamic.generation);
+      text('#alive', processMap.alive);
+      text('#tombstones', processMap.tombstones);
+      text('#latest', processMap.latest || 'none');
+
+      if (!rulesFormDirty) {
+        renderRulesForm(config);
+      }
+
+      renderConfig(config);
+      renderEntries((processMap.entries || []).filter(({value}) => !value.tombstone && value.has_mark));
+    }
+
+    function renderRulesForm(config) {
+      form.elements.rule_comm.value = config.rules.rule_comm || '';
+      form.elements.rule_cmd.value = config.rules.rule_cmd || '';
+      form.elements.rule_exe.value = config.rules.rule_exe || '';
+      form.elements.rule_ppid.value = config.rules.rule_ppid || '';
+      form.elements.mark_priority.value = config.mark_priority;
+      form.elements.mark_value.value = config.mark_value;
+    }
+
+    function renderConfig(config) {
+      const rows = [
+        ['Pin path', config.pin_path],
+        ['HTTP address', config.http_addr],
+        ['fwmark enabled', config.fwmark_enabled],
+        ['Mark priority', config.mark_priority],
+        ['Mark value', config.mark_value],
+      ];
+      document.querySelector('#config').innerHTML = rows.map(([name, value]) => (
+        `<tr><th>${escapeHTML(name)}</th><td><code>${escapeHTML(String(value))}</code></td></tr>`
+      )).join('');
+    }
+
+    function renderEntries(entries) {
+      document.querySelector('#entries').innerHTML = entries.map(({key, value}) => {
+        return `<tr>
+          <td>${key.tgid}</td>
+          <td><code>${key.start_time}</code></td>
+          <td><code>${value.has_mark ? value.mark : ''}</code></td>
+          <td>${value.priority}</td>
+          <td>${value.generation}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function escapeHTML(value) {
+      return value.replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      }[char]));
+    }
+
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      save.disabled = true;
+      setMessage('Updating...');
+      try {
+        const body = {
+          rule_comm: form.elements.rule_comm.value,
+          rule_cmd: form.elements.rule_cmd.value,
+          rule_exe: form.elements.rule_exe.value,
+          rule_ppid: form.elements.rule_ppid.value,
+          mark_priority: form.elements.mark_priority.value,
+          mark_value: form.elements.mark_value.value,
+        };
+        const response = await fetch('/rules', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'},
+          body: new URLSearchParams(body),
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        rulesFormDirty = false;
+        await loadState();
+        setMessage('Ruleset updated.');
+      } catch (error) {
+        setMessage(error.message.trim(), true);
+      } finally {
+        save.disabled = false;
+      }
+    });
+
+    form.addEventListener('input', () => {
+      rulesFormDirty = true;
+    });
+
+    document.querySelector('#refresh').addEventListener('click', () => {
+      loadState().catch(error => setMessage(error.message.trim(), true));
+    });
+    loadState().catch(error => setMessage(error.message.trim(), true));
+    setInterval(() => {
+      loadState().catch(error => setMessage(error.message.trim(), true));
+    }, refreshIntervalMS);
+  </script>
+</body>
+</html>
