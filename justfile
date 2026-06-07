@@ -7,10 +7,11 @@ generate:
 test:
   go test ./... -count=1
 
-# daemon:
-#   go generate ./...
-#   go build
-#   sudo ./ebpf-test -mark-name firefox
-#
-# watcher:
-#   sudo ./ebpf-test -watcher
+build: generate
+  go build -o ./pmark ./cmd
+
+daemon: build
+  sudo ./pmark -mark-name firefox
+
+watcher: build
+  sudo ./pmark -watcher

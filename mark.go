@@ -1217,3 +1217,23 @@ func int8String(raw [16]int8) string {
 	}
 	return string(buf)
 }
+
+func CombineChecks(left, right CheckFunc) CheckFunc {
+	return func(info ProcessInfo) (int8, uint64, bool) {
+		leftPriority, leftMark, leftOK := left(info)
+		rightPriority, rightMark, rightOK := right(info)
+		switch {
+		case leftOK && rightOK:
+			if rightPriority > leftPriority {
+				return rightPriority, rightMark, true
+			}
+			return leftPriority, leftMark, true
+		case rightOK:
+			return rightPriority, rightMark, true
+		case leftOK:
+			return leftPriority, leftMark, true
+		default:
+			return 0, 0, false
+		}
+	}
+}
