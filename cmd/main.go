@@ -29,6 +29,7 @@ func main() {
 	markName := flag.String("mark-name", "firefox", "comma-separated process identity substrings matched by the default check callback")
 	markValue := flag.Uint64("mark-value", defaultMarkValue, "mark value assigned by the default check callback")
 	fwmarkValue := flag.String("fmark-value", "", "fwmark format value to derive full mark from; overwrites mark-value")
+	enableFWMark := flag.Bool("fwmark", false, "enable Linux fwmark socket marking with fwmark eBPF hooks in daemon mode")
 	markPriority := flag.Int("mark-priority", 0, "signed int8 priority assigned by the default check callback; higher priority wins")
 	httpAddr := flag.String("http-addr", "127.0.0.1:8050", "daemon HTTP control listen address")
 	watcher := flag.Bool("watcher", false, "watch the pinned process map instead of running the daemon")
@@ -39,15 +40,6 @@ func main() {
 	}
 	priority := int8(*markPriority)
 
-	if *fwmarkValue != "" {
-		fwm, err := fwmark.Parse(*fwmarkValue)
-		if err != nil {
-			log.Fatalf("Failed to parse fwmark: %v", fwmarkValue)
-		}
-		mark := fwmark.ToMark(fwm)
-		markValue = &mark
-	}
-
 	if *watcher {
 		if err := runWatcher(*pinPath, *watchInterval); err != nil {
 			log.Fatal("Running watcher:", err)
@@ -55,9 +47,23 @@ func main() {
 		return
 	}
 
-	currentFWMark := fwmark.FromMark(*markValue)
-	log.Printf("Default mark %#x priority %d derives fwmark %s", *markValue, priority, fwmark.Format(currentFWMark))
-	log.Printf("Drop marked traffic: %s", fwmarkDropCommand(currentFWMark))
+	if *fwmarkValue != "" && !*enableFWMark {
+		log.Fatal("fmark-value requires -fwmark")
+	}
+	if *fwmarkValue != "" {
+		fwm, err := fwmark.Parse(*fwmarkValue)
+		if err != nil {
+			log.Fatalf("Failed to parse fwmark: %v", err)
+		}
+		mark := fwmark.ToMark(fwm)
+		markValue = &mark
+	}
+
+	if *enableFWMark {
+		currentFWMark := fwmark.FromMark(*markValue)
+		log.Printf("Default mark %#x priority %d derives fwmark %s", *markValue, priority, fwmark.Format(currentFWMark))
+		log.Printf("Drop marked traffic: %s", fwmarkDropCommand(currentFWMark))
+	}
 
 	nameCheck := defaultCheck(*markName, priority, *markValue)
 	daemon, err := core.NewDaemon(*pinPath, core.Callbacks{
@@ -70,25 +76,27 @@ func main() {
 		log.Fatal("Creating daemon:", err)
 	}
 
-	fwmarks, err := fwmark.NewManager(*pinPath, log.Printf)
-	if err != nil {
-		log.Fatal("Setting up fwmark eBPF hooks:", err)
-	}
-	defer func() {
-		if err := fwmarks.Close(); err != nil {
-			log.Printf("Closing fwmark hooks: %v", err)
+	if *enableFWMark {
+		fwmarks, err := fwmark.NewManager(*pinPath, log.Printf)
+		if err != nil {
+			log.Fatal("Setting up fwmark eBPF hooks:", err)
 		}
-	}()
+		defer func() {
+			if err := fwmarks.Close(); err != nil {
+				log.Printf("Closing fwmark hooks: %v", err)
+			}
+		}()
 
-	fwmarkProcessUpdate := fwmarks.ProcessUpdateCallback()
-	daemon.UpdateHooks(core.Callbacks{
-		ProcessEvent: logProcessEvent,
-		ProcessUpdate: func(update core.ProcessUpdate) {
-			fwmarkProcessUpdate(update)
-			logProcessUpdate(update)
-		},
-		Logf: log.Printf,
-	})
+		fwmarkProcessUpdate := fwmarks.ProcessUpdateCallback()
+		daemon.UpdateHooks(core.Callbacks{
+			ProcessEvent: logProcessEvent,
+			ProcessUpdate: func(update core.ProcessUpdate) {
+				fwmarkProcessUpdate(update)
+				logProcessUpdate(update)
+			},
+			Logf: log.Printf,
+		})
+	}
 
 	if err := daemon.Run(); err != nil {
 		log.Fatal("Running daemon:", err)
