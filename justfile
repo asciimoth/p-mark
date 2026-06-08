@@ -39,5 +39,5 @@ release-snapshot: release-check-env
 
 release: release-check-env
 	SSH_BIN="${SSH_BIN:-$(command -v ssh)}" goreleaser release --clean --skip=validate
-	"$MYREPO/maintain" save feat "add yggd $(git describe --tags --abbrev=0)"
+	"$MYREPO/maintain" save feat "add pmark $(git describe --tags --abbrev=0)"
 

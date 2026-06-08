@@ -77,7 +77,7 @@ signs:
 release:
   github:
     owner: asciimoth
-    name: pmark
+    name: p-mark
   draft: false
   prerelease: auto
   mode: replace
