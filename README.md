@@ -134,6 +134,38 @@ Then you can check stats with:
 sudo nft list chain inet ebpf_test_fwmark output
 ```
 
+## Installation
+### Nix
+Build or run directly from the flake:
+```sh
+nix build github:asciimoth/p-mark#pmark
+nix profile add github:asciimoth/p-mark#pmark
+```
+
+### Deb, and rpm-based systems
+Packages are published to [my deb/rpm repository](https://repo.moth.contact):
+
+Setup it for your sytstem via script (or manually):
+```sh
+curl https://repo.moth.contact/setup.sh | bash
+```
+
+Then install with your system package manager:
+```sh
+sudo apt install pmark
+# or
+sudo dnf install pmark
+# or
+sudo yum install pmark
+```
+
+### GitHub Releases
+Release archives and package artifacts are published on the
+[GitHub releases page](https://github.com/asciimoth/p-mark/releases).
+
+### Arch
+[AUR](https://aur.archlinux.org/packages/pmark-bin) is available
+
 ## Library Usage
 Note: You can find more marks usage examples in [ebpf-test](https://github.com/asciimoth/ebpf-test)
 
