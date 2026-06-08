@@ -1,4 +1,4 @@
- Flatpack app name matching in rules?# p-mark
+# p-mark
 `p-mark` is a Go library and command for tagging Linux process lifetimes with
 64-bit marks. User-space Go rules decide which processes are explicitly marked,
 and eBPF programs keep those marks inherited by children of marked processes.
@@ -66,15 +66,15 @@ sudo pmark \
 Enable fwmark integration and derive the 64-bit pmark value from a 32-bit Linux
 fwmark:
 ```sh
-sudo ./pmark -fwmark -fmark-value 0x00000042
+sudo ./pmark -fwmark -fmark-value 0xeb9f0001
 ```
 
 With `-fwmark`, new sockets created by marked processes receive the fwmark, and
 the userspace reconciler attempts to update sockets that were already open.
 
 ### Launching The Watcher
-The watcher does not run the daemon. It opens the pinned `processes` map and
-prints the currently marked process tree:
+The watcher does not run the marking logic. It opens the pinned `processes` map 
+and prints the currently marked process tree:
 ```sh
 sudo pmark -watcher -pin-path /sys/fs/bpf/pmark
 ```
@@ -113,6 +113,26 @@ panel exposes current state and lets the sample regexp rules and mark settings
 be updated without restarting the daemon.
 
 ![admin panel screenshot](./admin.png)
+
+### Using Marks With nftables
+If you've run the daemon with `-fwmark`, you can use it later in 
+iptables/nftables rules (e.g., for routing traffic of marked apps to different 
+routes).
+
+These rules will drop all packets owned by processes that have the mark attached
+by the daemon from the examples above, and thus block all firefox traffic:
+```bash
+sudo nft delete table inet ebpf_test_fwmark 2>/dev/null
+sudo nft add table inet ebpf_test_fwmark
+sudo nft 'add chain inet ebpf_test_fwmark output { type filter hook output priority 0; policy accept; }'
+sudo nft add rule inet ebpf_test_fwmark output meta mark 0xeb9f0001 counter drop
+sudo nft add rule inet ebpf_test_fwmark output socket mark 0xeb9f0001 counter drop
+```
+
+Then you can check stats with:
+```bash
+sudo nft list chain inet ebpf_test_fwmark output
+```
 
 ## Library Usage
 Note: You can find more marks usage examples in [ebpf-test](https://github.com/asciimoth/ebpf-test)
@@ -363,6 +383,7 @@ carry marks.
 
 ## TODO
 - [ ] Figure out what to do with [time namespaces](https://github.com/asciimoth/p-mark/issues/1).
+- [ ] Test on more distros arcs and configurations
 - [ ] Security audit
 - [ ] Flatpack app name matching in rules?
 
