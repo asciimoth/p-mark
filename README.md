@@ -1,4 +1,4 @@
-# p-mark
+ Flatpack app name matching in rules?# p-mark
 `p-mark` is a Go library and command for tagging Linux process lifetimes with
 64-bit marks. User-space Go rules decide which processes are explicitly marked,
 and eBPF programs keep those marks inherited by children of marked processes.
@@ -7,6 +7,12 @@ The root package is the process-marking engine. The `fwmark` package demonstrate
 one practical consumer: copying process marks into Linux socket `SO_MARK` /
 fwmark values so routing policy and firewall rules can match the process'
 traffic.
+
+> [!CAUTION]
+> p-mark is an __experimental__ and __unstable__ software that work under 
+> high privileges while havent being audited yet.
+> __Do not use in production.__  
+> Also check [issues](https://github.com/asciimoth/p-mark/issues).
 
 ## Binary Usage
 The daemon loads eBPF programs and pins maps in bpffs, so it normally needs root
@@ -109,6 +115,8 @@ be updated without restarting the daemon.
 ![admin panel screenshot](./admin.png)
 
 ## Library Usage
+Note: You can find more marks usage examples in [ebpf-test](https://github.com/asciimoth/ebpf-test)
+
 ### pmark
 Use the pmark for custom Go logic to decide process marks in your program.
 ```go
@@ -352,6 +360,11 @@ That replay/re-traversal step is important for race control and for processes
 that already existed before custom logic was attached. Without it, a consumer
 may only see future fork/exec transitions and miss live processes that already
 carry marks.
+
+## TODO
+- [ ] Figure out what to do with [time namespaces](https://github.com/asciimoth/p-mark/issues/1).
+- [ ] Security audit
+- [ ] Flatpack app name matching in rules?
 
 ## Licenses
 This repository is dual licensed under GPL or MIT; see
