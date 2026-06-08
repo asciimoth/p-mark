@@ -1,0 +1,105 @@
+version: 2
+
+project_name: pmark
+
+before:
+  hooks:
+    - go mod download
+    - go generate ./...
+
+builds:
+  - id: pmark
+    main: ./cmd
+    binary: pmark
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - "386"
+      - arm64
+
+archives:
+  - id: pmark
+    ids:
+      - pmark
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i686
+      {{- else }}{{ .Arch }}{{ end }}
+    formats:
+      - tar.gz
+    files:
+      - LICENSE-MIT
+      - LICENSE-GPL
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+nfpms:
+  - id: pmark
+    package_name: pmark
+    ids:
+      - pmark
+    vendor: asciimoth
+    homepage: https://github.com/asciimoth/p-mark
+    maintainer: "{{ .Env.PACKAGE_MAINTAINER }}"
+    description: Tool for tagging processes for split routing and other purposes
+    license: MIT OR GPL-3.0-or-later
+    section: net
+    priority: optional
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    rpm:
+      group: Applications/Internet
+
+signs:
+  - artifacts: all
+    cmd: gpg
+    args:
+      - --batch
+      - --yes
+      - --local-user
+      - "{{ .Env.GPG_FINGERPRINT }}"
+      - --output
+      - ${signature}
+      - --detach-sign
+      - ${artifact}
+
+release:
+  github:
+    owner: asciimoth
+    name: pmark
+  draft: false
+  prerelease: auto
+  mode: replace
+
+aurs:
+  - name: pmark-bin
+    homepage: https://github.com/asciimoth/p-mark
+    description: Tool for tagging processes for split routing and other purposes
+    maintainers:
+      - "{{ .Env.PACKAGE_MAINTAINER }}"
+    license: MIT OR GPL-3.0-or-later
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/{{ .ProjectName }}-bin.git"
+    git_ssh_command: '{{ .Env.SSH_BIN }} -i "{{ .KeyPath }}" -o StrictHostKeyChecking=accept-new -F /dev/null'
+    provides:
+      - pmark
+    depends:
+      - glibc
+    package: |-
+      install -Dm755 "./pmark" "${pkgdir}/usr/bin/pmark"
+
+publishers:
+  - name: "GH Pages deb/rpm repo"
+    cmd: "{{ .Env.MYREPO }}/maintain add {{ abs .ArtifactPath }}"
+
