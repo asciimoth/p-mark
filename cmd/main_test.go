@@ -111,3 +111,73 @@ func TestParseDefaultCheckUpdateJSON(t *testing.T) {
 		t.Fatalf("mark priority/value = %d/%d", update.MarkPriority, update.MarkValue)
 	}
 }
+
+func TestParseMultiRuleCLI(t *testing.T) {
+	rules, err := parseMultiRuleCLI("comm=firefox&cmd=chromium&exe=curl&ppid=123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rules.RuleComm != "firefox" || rules.RuleCmd != "chromium" || rules.RuleExe != "curl" || rules.RulePPID != "123" {
+		t.Fatalf("rules = %+v", rules)
+	}
+
+	rules, err = parseMultiRuleCLI("firefox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rules.RuleComm != "firefox" {
+		t.Fatalf("bare rule comm = %q", rules.RuleComm)
+	}
+}
+
+func TestParseMultiRuleUpdateForm(t *testing.T) {
+	req := httptest.NewRequest("POST", "/multirules", strings.NewReader("rule_comm=firefox&rule_cmd=chromium&rule_exe=curl&rule_ppid=123"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	update, err := parseMultiRuleUpdate(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.Rules.RuleComm != "firefox" || update.Rules.RuleCmd != "chromium" || update.Rules.RuleExe != "curl" || update.Rules.RulePPID != "123" {
+		t.Fatalf("rules = %+v", update.Rules)
+	}
+}
+
+func TestParseMultiRuleUpdateJSONAliases(t *testing.T) {
+	req := httptest.NewRequest("POST", "/multirules", strings.NewReader(`{"comm":"firefox","cmd":"chromium","exe":"curl","ppid":"123"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	update, err := parseMultiRuleUpdate(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.Rules.RuleComm != "firefox" || update.Rules.RuleCmd != "chromium" || update.Rules.RuleExe != "curl" || update.Rules.RulePPID != "123" {
+		t.Fatalf("rules = %+v", update.Rules)
+	}
+}
+
+func TestMultiRuleManagerRegisterAndList(t *testing.T) {
+	manager := newMultiRuleManager()
+	rule, err := manager.Register(defaultCheckRules{RuleComm: "^firefox$"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Tracker().ApplyProcess(core.ProcessInfo{
+		Key:  core.ProcessKey{Tgid: 10, StartTime: 20},
+		Comm: "firefox",
+	})
+
+	snapshot := manager.Snapshot()
+	if got := snapshot[core.ProcessKey{Tgid: 10, StartTime: 20}]; len(got) != 1 || got[0] != rule.ID {
+		t.Fatalf("matched rules = %v, want [%d]", got, rule.ID)
+	}
+	if list := manager.List(); len(list) != 1 || list[0].ID != rule.ID {
+		t.Fatalf("list = %+v", list)
+	}
+	if !manager.Unregister(rule.ID) {
+		t.Fatal("expected unregister to succeed")
+	}
+	if got := manager.Snapshot()[core.ProcessKey{Tgid: 10, StartTime: 20}]; len(got) != 0 {
+		t.Fatalf("matched rules after unregister = %v", got)
+	}
+}

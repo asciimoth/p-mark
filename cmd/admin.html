@@ -128,6 +128,17 @@
     .error {
       color: #b00020;
     }
+    .danger {
+      border-color: color-mix(in srgb, #b00020 60%, CanvasText 20%);
+    }
+    .compact {
+      grid-template-columns: repeat(4, minmax(0, 1fr)) auto;
+      align-items: end;
+    }
+    .empty {
+      color: color-mix(in srgb, CanvasText 60%, transparent);
+      font-style: italic;
+    }
     @media (max-width: 760px) {
       main {
         padding: 16px;
@@ -137,6 +148,7 @@
         flex-direction: column;
       }
       form,
+      .compact,
       .summary {
         grid-template-columns: 1fr;
       }
@@ -177,6 +189,33 @@
       </div>
     </form>
 
+    <h2>Multirules</h2>
+    <form id="multirule" class="compact">
+      <label>Comm regexps<input name="rule_comm" autocomplete="off"></label>
+      <label>Cmdline regexps<input name="rule_cmd" autocomplete="off"></label>
+      <label>Exe regexps<input name="rule_exe" autocomplete="off"></label>
+      <label>Parent PIDs<input name="rule_ppid" autocomplete="off"></label>
+      <button id="add-multirule" type="submit">Add rule</button>
+      <div class="actions">
+        <span id="multirule-message" class="status"></span>
+      </div>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Comm</th>
+            <th>Cmdline</th>
+            <th>Exe</th>
+            <th>Parent PIDs</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="multirules"></tbody>
+      </table>
+    </div>
+
     <h2>Configuration</h2>
     <div class="table-wrap">
       <table>
@@ -194,17 +233,37 @@
             <th>Mark</th>
             <th>Priority</th>
             <th>Generation</th>
+            <th>Matched rules</th>
           </tr>
         </thead>
         <tbody id="entries"></tbody>
+      </table>
+    </div>
+
+    <h2>Observed Processes</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>PID</th>
+            <th>PPID</th>
+            <th>Comm</th>
+            <th>Exe</th>
+            <th>Matched rules</th>
+          </tr>
+        </thead>
+        <tbody id="processes"></tbody>
       </table>
     </div>
   </main>
 
   <script>
     const form = document.querySelector('#rules');
+    const multiruleForm = document.querySelector('#multirule');
     const message = document.querySelector('#message');
+    const multiruleMessage = document.querySelector('#multirule-message');
     const save = document.querySelector('#save');
+    const addMultirule = document.querySelector('#add-multirule');
     const refreshIntervalMS = 3000;
     let rulesFormDirty = false;
 
@@ -215,6 +274,11 @@
     function setMessage(value, isError = false) {
       message.textContent = value;
       message.classList.toggle('error', isError);
+    }
+
+    function setMultiruleMessage(value, isError = false) {
+      multiruleMessage.textContent = value;
+      multiruleMessage.classList.toggle('error', isError);
     }
 
     async function loadState() {
@@ -243,7 +307,9 @@
       }
 
       renderConfig(config);
+      renderMultirules(dynamic.multirules || []);
       renderEntries((processMap.entries || []).filter(({value}) => !value.tombstone && value.has_mark));
+      renderProcesses(dynamic.processes || []);
     }
 
     function renderRulesForm(config) {
@@ -269,15 +335,44 @@
     }
 
     function renderEntries(entries) {
-      document.querySelector('#entries').innerHTML = entries.map(({key, value}) => {
+      document.querySelector('#entries').innerHTML = entries.map(({key, value, matched_rules}) => {
         return `<tr>
           <td>${key.tgid}</td>
           <td><code>${key.start_time}</code></td>
           <td><code>${value.has_mark ? value.mark : ''}</code></td>
           <td>${value.priority}</td>
           <td>${value.generation}</td>
+          <td>${formatRuleIDs(matched_rules)}</td>
         </tr>`;
       }).join('');
+    }
+
+    function renderMultirules(rules) {
+      document.querySelector('#multirules').innerHTML = rules.map(({id, rule}) => `<tr>
+        <td><code>${id}</code></td>
+        <td><code>${escapeHTML(rule.rule_comm || '')}</code></td>
+        <td><code>${escapeHTML(rule.rule_cmd || '')}</code></td>
+        <td><code>${escapeHTML(rule.rule_exe || '')}</code></td>
+        <td><code>${escapeHTML(rule.rule_ppid || '')}</code></td>
+        <td><button class="danger" type="button" data-delete-multirule="${id}">Delete</button></td>
+      </tr>`).join('') || '<tr><td class="empty" colspan="6">No multirules registered</td></tr>';
+    }
+
+    function renderProcesses(processes) {
+      document.querySelector('#processes').innerHTML = processes.map(({key, info, matched_rules}) => `<tr>
+        <td>${key.tgid}</td>
+        <td>${info.ppid}</td>
+        <td>${escapeHTML(info.comm || '')}</td>
+        <td><code>${escapeHTML(info.exe || '')}</code></td>
+        <td>${formatRuleIDs(matched_rules)}</td>
+      </tr>`).join('');
+    }
+
+    function formatRuleIDs(ids) {
+      if (!ids || ids.length === 0) {
+        return '';
+      }
+      return ids.map(id => `<code>${id}</code>`).join(', ');
     }
 
     function escapeHTML(value) {
@@ -323,6 +418,59 @@
 
     form.addEventListener('input', () => {
       rulesFormDirty = true;
+    });
+
+    multiruleForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      addMultirule.disabled = true;
+      setMultiruleMessage('Adding...');
+      try {
+        const body = {
+          rule_comm: multiruleForm.elements.rule_comm.value,
+          rule_cmd: multiruleForm.elements.rule_cmd.value,
+          rule_exe: multiruleForm.elements.rule_exe.value,
+          rule_ppid: multiruleForm.elements.rule_ppid.value,
+        };
+        const response = await fetch('/multirules', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'},
+          body: new URLSearchParams(body),
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        multiruleForm.reset();
+        await loadState();
+        setMultiruleMessage('Rule added.');
+      } catch (error) {
+        setMultiruleMessage(error.message.trim(), true);
+      } finally {
+        addMultirule.disabled = false;
+      }
+    });
+
+    document.querySelector('#multirules').addEventListener('click', async event => {
+      const id = event.target.dataset.deleteMultirule;
+      if (!id) {
+        return;
+      }
+      event.target.disabled = true;
+      setMultiruleMessage('Deleting...');
+      try {
+        const response = await fetch(`/multirules/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+          headers: {'Accept': 'application/json'},
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        await loadState();
+        setMultiruleMessage('Rule deleted.');
+      } catch (error) {
+        setMultiruleMessage(error.message.trim(), true);
+      } finally {
+        event.target.disabled = false;
+      }
     });
 
     document.querySelector('#refresh').addEventListener('click', () => {

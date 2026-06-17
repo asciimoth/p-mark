@@ -55,6 +55,7 @@ type jsonDaemonDynamicState struct {
 	Generation uint64                `json:"generation"`
 	ProcessMap jsonProcessMapState   `json:"process_map"`
 	Processes  []jsonObservedProcess `json:"processes"`
+	MultiRules []jsonMultiRule       `json:"multirules"`
 }
 
 type jsonProcessMapState struct {
@@ -65,11 +66,18 @@ type jsonProcessMapState struct {
 }
 
 type jsonProcessMapEntry struct {
-	Key   jsonProcessKey   `json:"key"`
-	Value jsonProcessValue `json:"value"`
+	Key          jsonProcessKey   `json:"key"`
+	Value        jsonProcessValue `json:"value"`
+	MatchedRules []uint64         `json:"matched_rules,omitempty"`
 }
 
 type jsonObservedProcess struct {
-	Key  jsonProcessKey `json:"key"`
-	Info jsonProcInfo   `json:"info"`
+	Key          jsonProcessKey `json:"key"`
+	Info         jsonProcInfo   `json:"info"`
+	MatchedRules []uint64       `json:"matched_rules,omitempty"`
+}
+
+type jsonMultiRule struct {
+	ID   uint64            `json:"id"`
+	Rule defaultCheckRules `json:"rule"`
 }

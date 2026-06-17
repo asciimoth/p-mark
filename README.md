@@ -225,6 +225,49 @@ Important API points:
   generation.
 - `GrabProcessMapState` is useful for admin panels and watchers.
 
+### multirule
+Use `multirule` when you need a userspace-only view of which processes match
+multiple independent rules, without creating pmark marks for those matches.
+```go
+tracker := multirule.New()
+
+browserRule := tracker.RegisterRule(func(info pmark.ProcessInfo) bool {
+	return info.Comm == "firefox"
+})
+
+daemon, err := pmark.NewDaemon("/sys/fs/bpf/pmark", pmark.Callbacks{
+	Check:        tracker.CheckCallback(),
+	ProcessEvent: tracker.ProcessEventCallback(),
+	Logf:         log.Printf,
+}, 0, 0)
+if err != nil {
+	log.Fatal(err)
+}
+
+_ = browserRule
+```
+
+`Tracker.CheckCallback` observes process information and always returns
+`ok=false`, so the tracker does not ask pmark to write any eBPF process marks.
+Each observed process is checked against registered rules and inherits matched
+rule IDs from the latest known parent. `RegisterRule` immediately checks all
+already observed processes, `UnregisterRule` removes the ID from every entry, and
+`RuleIDs`, `Matches`, and `Snapshot` expose the current in-memory state.
+
+For callers that only have a PID, `RuleIDsByPID` and `MatchesPID` look up the
+latest `pmark.ProcessKey` observed for that PID:
+
+```go
+if tracker.MatchesPID(pid, browserRule) {
+	log.Printf("pid %d is in the browser rule set", pid)
+}
+```
+
+PID-only lookups are convenient but less precise than `pmark.ProcessKey`
+lookups. Linux can reuse PIDs, so when multiple process lifetimes have used the
+same PID, `multirule` maps that PID to the latest observed `ProcessKey`. When an
+exit event removes that `ProcessKey`, the associated PID lookup is removed too.
+
 ### fwmark
 Use `fwmark` when the mark should become the Linux socket mark used by routing
 policy or firewall rules. The fwmark value is stored in the high 32 bits of the
@@ -437,4 +480,3 @@ You can regenerate them with:
 ```sh
 go generate ./...
 ```
-

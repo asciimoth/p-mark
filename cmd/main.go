@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 
 	core "github.com/asciimoth/p-mark"
 	"github.com/asciimoth/p-mark/fwmark"
+	"github.com/asciimoth/p-mark/multirule"
 )
 
 const defaultMarkValue = 0xeb9f000100000001
@@ -42,6 +44,8 @@ func main() {
 	httpAddr := flag.String("http-addr", "127.0.0.1:8050", "daemon HTTP control listen address")
 	watcher := flag.Bool("watcher", false, "watch the pinned process map instead of running the daemon")
 	watchInterval := flag.Duration("watch-interval", time.Second, "interval for watcher refreshes")
+	var cliMultiRules multiRuleFlag
+	flag.Var(&cliMultiRules, "multirule", "repeatable userspace rule tracked by multirule; use query-style fields comm/cmd/exe/ppid or rule_comm/rule_cmd/rule_exe/rule_ppid")
 	flag.Parse()
 	if *markPriority < -128 || *markPriority > 127 {
 		log.Fatalf("mark-priority must be between -128 and 127, got %d", *markPriority)
@@ -83,9 +87,26 @@ func main() {
 	if err != nil {
 		log.Fatal("Creating default checker:", err)
 	}
+	ruleTracker := newMultiRuleManager()
+	for _, spec := range cliMultiRules {
+		rules, err := parseMultiRuleCLI(spec)
+		if err != nil {
+			log.Fatalf("Parsing multirule %q: %v", spec, err)
+		}
+		rule, err := ruleTracker.Register(rules)
+		if err != nil {
+			log.Fatalf("Registering multirule %q: %v", spec, err)
+		}
+		log.Printf("Registered multirule id=%d rules=%+v", rule.ID, rules)
+	}
+	check := combinedCheck(ruleTracker.Tracker(), nameCheck)
+	processEvent := func(event core.ProcessEvent) {
+		ruleTracker.ApplyProcessEvent(event)
+		logProcessEvent(event)
+	}
 	daemon, err := core.NewDaemon(*pinPath, core.Callbacks{
-		Check:         nameCheck,
-		ProcessEvent:  logProcessEvent,
+		Check:         check,
+		ProcessEvent:  processEvent,
 		ProcessUpdate: logProcessUpdate,
 		Logf:          log.Printf,
 	}, 0, 0) // TODO: Set up tcev and tttl via cli args
@@ -106,7 +127,7 @@ func main() {
 
 		fwmarkProcessUpdate := fwmarks.ProcessUpdateCallback()
 		daemon.UpdateHooks(core.Callbacks{
-			ProcessEvent: logProcessEvent,
+			ProcessEvent: processEvent,
 			ProcessUpdate: func(update core.ProcessUpdate) {
 				fwmarkProcessUpdate(update)
 				logProcessUpdate(update)
@@ -128,7 +149,7 @@ func main() {
 		Rules:         checkRules,
 		MarkPriority:  priority,
 		MarkValue:     *markValue,
-	})
+	}, ruleTracker)
 	if err != nil {
 		log.Fatal("Starting daemon HTTP control server:", err)
 	}
@@ -164,7 +185,7 @@ type daemonControlConfig struct {
 	MarkValue     uint64            `json:"mark_value,string"`
 }
 
-func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonControlConfig) (*daemonControlServer, error) {
+func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonControlConfig, ruleTracker *multiRuleManager) (*daemonControlServer, error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -192,7 +213,7 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonCon
 		stateConfig := config
 		controlMu.Unlock()
 
-		state, err := daemonControlState(daemon, stateConfig)
+		state, err := daemonControlState(daemon, stateConfig, ruleTracker)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -221,7 +242,7 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonCon
 		}
 		controlMu.Lock()
 		nameCheck = nextCheck
-		_, err = daemon.SetChecker(nameCheck)
+		_, err = daemon.SetChecker(combinedCheck(ruleTracker.Tracker(), nameCheck))
 		if err == nil {
 			config.Rules = update.Rules
 			config.MarkPriority = update.MarkPriority
@@ -240,6 +261,51 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonCon
 	}
 	mux.HandleFunc("POST /rules", handleRuleUpdate)
 	mux.HandleFunc("POST /mark-name", handleRuleUpdate)
+	mux.HandleFunc("GET /multirules", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(ruleTracker.List()); err != nil {
+			log.Printf("writing HTTP response: %v", err)
+		}
+	})
+	mux.HandleFunc("POST /multirules", func(w http.ResponseWriter, r *http.Request) {
+		update, err := parseMultiRuleUpdate(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		rule, err := ruleTracker.Register(update.Rules)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := daemon.ForceProcessTraversal(); err != nil {
+			ruleTracker.Unregister(rule.ID)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(rule); err != nil {
+			log.Printf("writing HTTP response: %v", err)
+		}
+	})
+	mux.HandleFunc("DELETE /multirules/{id}", func(w http.ResponseWriter, r *http.Request) {
+		ruleID, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid multirule id", http.StatusBadRequest)
+			return
+		}
+		if !ruleTracker.Unregister(ruleID) {
+			http.Error(w, "multirule not found", http.StatusNotFound)
+			return
+		}
+		if err := daemon.ForceProcessTraversal(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	server := &http.Server{
 		Handler:           mux,
@@ -267,17 +333,19 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonCon
 	return control, nil
 }
 
-func daemonControlState(daemon *core.Daemon, config daemonControlConfig) (jsonDaemonState, error) {
+func daemonControlState(daemon *core.Daemon, config daemonControlConfig, ruleTracker *multiRuleManager) (jsonDaemonState, error) {
 	snapshot, err := core.GrabProcessMapState(config.PinPath)
 	if err != nil {
 		return jsonDaemonState{}, err
 	}
+	ruleMatches := ruleTracker.Snapshot()
 
 	entries := make([]jsonProcessMapEntry, 0, len(snapshot.Entries))
 	for key, value := range snapshot.Entries {
 		entries = append(entries, jsonProcessMapEntry{
-			Key:   jsonKey(key),
-			Value: jsonValue(value),
+			Key:          jsonKey(key),
+			Value:        jsonValue(value),
+			MatchedRules: ruleMatches[key],
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -290,8 +358,9 @@ func daemonControlState(daemon *core.Daemon, config daemonControlConfig) (jsonDa
 	procs := make([]jsonObservedProcess, 0, len(snapshot.Procs))
 	for _, proc := range snapshot.Procs {
 		procs = append(procs, jsonObservedProcess{
-			Key:  jsonKey(proc.Key),
-			Info: jsonProc(proc),
+			Key:          jsonKey(proc.Key),
+			Info:         jsonProc(proc),
+			MatchedRules: ruleMatches[proc.Key],
 		})
 	}
 	sort.Slice(procs, func(i, j int) bool {
@@ -313,7 +382,8 @@ func daemonControlState(daemon *core.Daemon, config daemonControlConfig) (jsonDa
 				Latest:     snapshot.Latest,
 				Entries:    entries,
 			},
-			Processes: procs,
+			Processes:  procs,
+			MultiRules: ruleTracker.List(),
 		},
 	}, nil
 }
@@ -341,6 +411,172 @@ type defaultCheckUpdate struct {
 	Rules        defaultCheckRules `json:"-"`
 	MarkPriority int8              `json:"mark_priority"`
 	MarkValue    uint64            `json:"mark_value"`
+}
+
+type multiRuleFlag []string
+
+func (f *multiRuleFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *multiRuleFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
+type multiRuleManager struct {
+	tracker *multirule.Tracker
+
+	mu    sync.RWMutex
+	rules map[uint64]defaultCheckRules
+}
+
+type multiRuleUpdate struct {
+	defaultCheckRules
+	Rules defaultCheckRules `json:"-"`
+}
+
+func newMultiRuleManager() *multiRuleManager {
+	return &multiRuleManager{
+		tracker: multirule.New(),
+		rules:   make(map[uint64]defaultCheckRules),
+	}
+}
+
+func (m *multiRuleManager) Tracker() *multirule.Tracker {
+	return m.tracker
+}
+
+func (m *multiRuleManager) Register(rules defaultCheckRules) (jsonMultiRule, error) {
+	matcher, err := compileDefaultCheckRules(rules)
+	if err != nil {
+		return jsonMultiRule{}, err
+	}
+	id := m.tracker.RegisterRule(func(info core.ProcessInfo) bool {
+		return matcher.hasRules() && matcher.matches(info)
+	})
+
+	m.mu.Lock()
+	m.rules[id] = rules
+	m.mu.Unlock()
+
+	return jsonMultiRule{ID: id, Rule: rules}, nil
+}
+
+func (m *multiRuleManager) Unregister(ruleID uint64) bool {
+	if !m.tracker.UnregisterRule(ruleID) {
+		return false
+	}
+
+	m.mu.Lock()
+	delete(m.rules, ruleID)
+	m.mu.Unlock()
+	return true
+}
+
+func (m *multiRuleManager) ApplyProcessEvent(event core.ProcessEvent) {
+	m.tracker.ApplyProcessEvent(event)
+}
+
+func (m *multiRuleManager) Snapshot() map[core.ProcessKey][]uint64 {
+	return m.tracker.Snapshot()
+}
+
+func (m *multiRuleManager) List() []jsonMultiRule {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]jsonMultiRule, 0, len(m.rules))
+	for id, rules := range m.rules {
+		out = append(out, jsonMultiRule{ID: id, Rule: rules})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func parseMultiRuleCLI(spec string) (defaultCheckRules, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return defaultCheckRules{}, nil
+	}
+	if !strings.Contains(spec, "=") {
+		return defaultCheckRules{RuleComm: spec}, nil
+	}
+	values, err := url.ParseQuery(spec)
+	if err != nil {
+		return defaultCheckRules{}, err
+	}
+	return normalizeMultiRuleValues(func(name string) string {
+		return values.Get(name)
+	}), nil
+}
+
+func parseMultiRuleUpdate(r *http.Request) (multiRuleUpdate, error) {
+	update := multiRuleUpdate{}
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		var raw map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			return multiRuleUpdate{}, fmt.Errorf("decode JSON body: %w", err)
+		}
+		update.defaultCheckRules = normalizeMultiRuleValues(func(name string) string {
+			return raw[name]
+		})
+	} else {
+		if err := r.ParseForm(); err != nil {
+			return multiRuleUpdate{}, fmt.Errorf("parse form body: %w", err)
+		}
+		update.defaultCheckRules = normalizeMultiRuleValues(func(name string) string {
+			return r.Form.Get(name)
+		})
+	}
+
+	update.Rules = normalizeMultiRuleValues(func(name string) string {
+		switch name {
+		case "rule_comm":
+			return update.RuleComm
+		case "rule_cmd":
+			return update.RuleCmd
+		case "rule_exe":
+			return update.RuleExe
+		case "rule_ppid":
+			return update.RulePPID
+		default:
+			return ""
+		}
+	})
+	update.defaultCheckRules = update.Rules
+	return update, nil
+}
+
+func normalizeMultiRuleValues(get func(string) string) defaultCheckRules {
+	first := func(names ...string) string {
+		for _, name := range names {
+			if value := strings.TrimSpace(get(name)); value != "" {
+				return value
+			}
+		}
+		return ""
+	}
+	return defaultCheckRules{
+		RuleComm: first("rule_comm", "comm"),
+		RuleCmd:  first("rule_cmd", "cmd"),
+		RuleExe:  first("rule_exe", "exe"),
+		RulePPID: first("rule_ppid", "ppid"),
+	}
+}
+
+func combinedCheck(ruleTracker *multirule.Tracker, markCheck core.CheckFunc) core.CheckFunc {
+	if markCheck == nil {
+		markCheck = func(core.ProcessInfo) (int8, uint64, bool) { return 0, 0, false }
+	}
+	return func(info core.ProcessInfo) (int8, uint64, bool) {
+		if ruleTracker != nil {
+			ruleTracker.ApplyProcess(info)
+		}
+		return markCheck(info)
+	}
 }
 
 func parseDefaultCheckUpdate(r *http.Request, defaultMarkPriority int8, defaultMarkValue uint64) (defaultCheckUpdate, error) {
