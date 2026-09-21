@@ -129,6 +129,154 @@ func TestCanInheritCurrentGenerationRejectsOldGeneration(t *testing.T) {
 	}
 }
 
+func TestHandleEventIgnoresUnknownExit(t *testing.T) {
+	key := ProcessKey{Tgid: 999999, StartTime: 1001}
+	updates := 0
+	events := 0
+	m := &marker{
+		mirror: make(map[ProcessKey]ProcessValue),
+		callbacks: Callbacks{
+			ProcessUpdate: func(ProcessUpdate) { updates++ },
+			ProcessEvent:  func(ProcessEvent) { events++ },
+		},
+	}
+
+	m.handleEvent(markEvent{Type: eventExit, Key: key})
+
+	if len(m.mirror) != 0 {
+		t.Fatalf("mirror entries = %d, want 0", len(m.mirror))
+	}
+	if updates != 0 {
+		t.Fatalf("ProcessUpdate calls = %d, want 0", updates)
+	}
+	if events != 0 {
+		t.Fatalf("ProcessEvent calls = %d, want 0", events)
+	}
+}
+
+func TestHandleEventTombstonesUserspaceTrackedExit(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      ProcessValue
+		wantUpdate int
+		wantEvent  int
+	}{
+		{
+			name: "marked",
+			value: ProcessValue{
+				HasMark:    true,
+				Generation: 3,
+				Mark:       100,
+				Timestamp:  1,
+			},
+			wantUpdate: 1,
+			wantEvent:  1,
+		},
+		{
+			name: "live no mark",
+			value: ProcessValue{
+				HasMark:    false,
+				Generation: 4,
+				Timestamp:  1,
+			},
+		},
+	}
+
+	for index, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			key := ProcessKey{Tgid: uint32(999990 + index), StartTime: uint64(2001 + index)}
+			updates := 0
+			events := 0
+			m := &marker{
+				mirror: map[ProcessKey]ProcessValue{key: tc.value},
+				callbacks: Callbacks{
+					ProcessUpdate: func(ProcessUpdate) { updates++ },
+					ProcessEvent:  func(ProcessEvent) { events++ },
+				},
+			}
+
+			m.handleEvent(markEvent{Type: eventExit, Key: key})
+
+			got, ok := m.mirror[key]
+			if !ok {
+				t.Fatalf("tracked process is missing from mirror")
+			}
+			if !got.Tombstone {
+				t.Fatalf("Tombstone = false, want true")
+			}
+			if got.HasMark != tc.value.HasMark || got.Generation != tc.value.Generation || got.Mark != tc.value.Mark {
+				t.Fatalf("tombstone = %+v, want tracked state from %+v", got, tc.value)
+			}
+			if got.Timestamp <= tc.value.Timestamp {
+				t.Fatalf("Timestamp = %d, want greater than %d", got.Timestamp, tc.value.Timestamp)
+			}
+			if updates != tc.wantUpdate {
+				t.Fatalf("ProcessUpdate calls = %d, want %d", updates, tc.wantUpdate)
+			}
+			if events != tc.wantEvent {
+				t.Fatalf("ProcessEvent calls = %d, want %d", events, tc.wantEvent)
+			}
+		})
+	}
+}
+
+func TestHandleEventAcceptsKernelTrackedExitMissingFromMirror(t *testing.T) {
+	tests := []struct {
+		name    string
+		hasMark bool
+		value   ProcessValue
+	}{
+		{
+			name:    "marked",
+			hasMark: true,
+			value: ProcessValue{
+				Tombstone:  true,
+				HasMark:    true,
+				Generation: 5,
+				Mark:       200,
+				Timestamp:  1,
+			},
+		},
+		{
+			name: "live no mark",
+			value: ProcessValue{
+				Tombstone:  true,
+				HasMark:    false,
+				Generation: 6,
+				Timestamp:  1,
+			},
+		},
+	}
+
+	for index, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			key := ProcessKey{Tgid: uint32(999980 + index), StartTime: uint64(3001 + index)}
+			m := &marker{mirror: make(map[ProcessKey]ProcessValue)}
+
+			m.handleEvent(markEvent{
+				Type:    eventExit,
+				Key:     key,
+				HasMark: tc.hasMark,
+				Value:   tc.value,
+			})
+
+			got, ok := m.mirror[key]
+			if !ok {
+				t.Fatalf("kernel-tracked process is missing from mirror")
+			}
+			if !got.Tombstone {
+				t.Fatalf("Tombstone = false, want true")
+			}
+			if got.HasMark != tc.value.HasMark || got.Generation != tc.value.Generation || got.Mark != tc.value.Mark {
+				t.Fatalf("mirror value = %+v, want kernel state from %+v", got, tc.value)
+			}
+			if got.Timestamp <= tc.value.Timestamp {
+				t.Fatalf("Timestamp = %d, want greater than %d", got.Timestamp, tc.value.Timestamp)
+			}
+		})
+	}
+}
+
 func TestUpdateHooksReplaysExistingLiveProcessUpdates(t *testing.T) {
 	liveMarked := ProcessKey{Tgid: 101, StartTime: 1001}
 	liveUnmarked := ProcessKey{Tgid: 102, StartTime: 1002}

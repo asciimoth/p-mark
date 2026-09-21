@@ -613,6 +613,15 @@ func (m *marker) handleEvent(event markEvent) {
 		 */
 		value := event.Value
 		old, ok := m.mirror[event.Key]
+		/*
+		 * The BPF exit handler tombstones only an existing kernel entry. An
+		 * event without a mirror entry or a BPF tombstone is therefore for an
+		 * untracked process. Ignore it so host-wide exit traffic cannot fill
+		 * the process map with unrelated tombstones.
+		 */
+		if !ok && !event.Value.Tombstone {
+			return
+		}
 		logExit := event.HasMark || (ok && !old.Tombstone && old.HasMark)
 		if ok {
 			value = old
