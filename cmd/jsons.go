@@ -52,10 +52,19 @@ type jsonDaemonState struct {
 }
 
 type jsonDaemonDynamicState struct {
-	Generation uint64                `json:"generation"`
-	ProcessMap jsonProcessMapState   `json:"process_map"`
-	Processes  []jsonObservedProcess `json:"processes"`
-	MultiRules []jsonMultiRule       `json:"multirules"`
+	Generation   uint64                `json:"generation"`
+	KernelPolicy jsonKernelPolicy      `json:"kernel_policy"`
+	ProcessMap   jsonProcessMapState   `json:"process_map"`
+	Processes    []jsonObservedProcess `json:"processes"`
+	MultiRules   []jsonMultiRule       `json:"multirules"`
+}
+
+type jsonKernelPolicy struct {
+	Mode          string   `json:"mode"`
+	Generation    uint64   `json:"generation"`
+	RuleCount     int      `json:"rule_count"`
+	PromotedComm  []string `json:"promoted_comm"`
+	FallbackRules []string `json:"fallback_rules"`
 }
 
 type jsonProcessMapState struct {

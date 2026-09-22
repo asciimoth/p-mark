@@ -38,6 +38,12 @@
 #define EVENT_EXIT 2
 #define EVENT_EXEC 3
 
+#define KERNEL_POLICY_USERSPACE_ONLY 0
+#define KERNEL_POLICY_POSITIVE_ONLY 1
+#define KERNEL_POLICY_AUTHORITATIVE 2
+
+#define MAX_KERNEL_COMM_RULES 1024
+
 /*
  * Small CO-RE view of task_struct. start_boottime is the timestamp used by
  * procfs for field 22 in /proc/<pid>/stat, so it can be shared with userspace.
@@ -78,6 +84,26 @@ struct process_value {
 };
 
 /*
+ * Exact comm policies use generation-qualified keys. Userspace populates a
+ * complete inactive generation before it changes active_policy. This lets an
+ * exec observe either complete policy generation, never a partial update.
+ */
+struct comm_rule_key {
+	__u64 generation;
+	char comm[TASK_COMM_LEN];
+};
+
+struct comm_rule_value {
+	__s8 priority;
+	__u64 mark;
+};
+
+struct kernel_policy_state {
+	__u64 generation;
+	__u8 mode;
+};
+
+/*
  * Ring events carry the kernel's view at the time of the transition.
  */
 struct event {
@@ -98,6 +124,22 @@ struct {
 	__type(value, struct process_value);
 	__uint(max_entries, 32768);
 } processes SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, struct comm_rule_key);
+	__type(value, struct comm_rule_value);
+	__uint(max_entries, MAX_KERNEL_COMM_RULES * 2);
+} comm_rules SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, __u32);
+	__type(value, struct kernel_policy_state);
+	__uint(max_entries, 1);
+} active_policy SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -124,6 +166,25 @@ static __always_inline struct process_key process_key_from_task(struct task_stru
 static __always_inline void copy_task_comm(char *dst, struct task_struct *task)
 {
 	__builtin_memcpy(dst, task->comm, TASK_COMM_LEN);
+}
+
+static __always_inline bool next_process_value_wins(const struct process_value *old, const struct process_value *next)
+{
+	/* Keep this order in sync with preferProcessValue in mark.go. */
+	if (old->tombstone != next->tombstone) {
+		return next->tombstone;
+	}
+	if (old->generation != next->generation) {
+		return next->generation > old->generation;
+	}
+	if (old->priority != next->priority) {
+		return next->priority > old->priority;
+	}
+	/* The historical field name is inverted: true means explicit. */
+	if (old->inheritance != next->inheritance) {
+		return next->inheritance;
+	}
+	return next->timestamp >= old->timestamp;
 }
 
 SEC("tp_btf/sched_process_fork")
@@ -240,6 +301,11 @@ int BPF_PROG(handle_sched_process_exec, struct task_struct *task, int old_pid, v
 	struct process_key key = process_key_from_task(task);
 	struct process_value value = {};
 	struct process_value *existing_value;
+	struct kernel_policy_state *policy;
+	struct comm_rule_value *rule;
+	struct comm_rule_key rule_key = {};
+	struct process_value candidate = {};
+	__u32 policy_key = 0;
 	__u32 pid = task->pid;
 	__u32 tgid = task->tgid;
 	bool has_mark = false;
@@ -251,8 +317,47 @@ int BPF_PROG(handle_sched_process_exec, struct task_struct *task, int old_pid, v
 	existing_value = bpf_map_lookup_elem(&processes, &key);
 	if (existing_value) {
 		value = *existing_value;
-		has_mark = !existing_value->tombstone && existing_value->has_mark;
 	}
+
+	/*
+	 * Apply the exec decision before reserving an event. The process map update
+	 * must not depend on ring-buffer space or userspace scheduling.
+	 */
+	policy = bpf_map_lookup_elem(&active_policy, &policy_key);
+	if (policy && policy->generation != 0 &&
+	    (policy->mode == KERNEL_POLICY_POSITIVE_ONLY || policy->mode == KERNEL_POLICY_AUTHORITATIVE)) {
+		rule_key.generation = policy->generation;
+		copy_task_comm(rule_key.comm, task);
+		rule = bpf_map_lookup_elem(&comm_rules, &rule_key);
+
+		/* A missing process entry already represents an authoritative miss. */
+		if (rule || (policy->mode == KERNEL_POLICY_AUTHORITATIVE && existing_value)) {
+			candidate.generation = policy->generation;
+			candidate.timestamp = now_ns();
+			if (rule) {
+				candidate.inheritance = true;
+				candidate.has_mark = true;
+				candidate.priority = rule->priority;
+				candidate.mark = rule->mark;
+			} else if (existing_value && existing_value->generation == policy->generation) {
+				/*
+				 * Preserve comparison fields so a same-generation miss can
+				 * clear a prior or inherited mark by its newer timestamp.
+				 */
+				candidate.inheritance = existing_value->inheritance;
+				candidate.priority = existing_value->priority;
+				candidate.mark = existing_value->mark;
+			}
+
+			if (!existing_value || next_process_value_wins(existing_value, &candidate)) {
+				if (bpf_map_update_elem(&processes, &key, &candidate, BPF_ANY) == 0) {
+					value = candidate;
+				}
+			}
+		}
+	}
+
+	has_mark = !value.tombstone && value.has_mark;
 
 	struct event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event) {

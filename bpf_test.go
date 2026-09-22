@@ -5,6 +5,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 )
 
 func TestBPFCollectionSpec(t *testing.T) {
@@ -45,9 +46,45 @@ func TestBPFCollectionSpec(t *testing.T) {
 	}
 
 	assertBPFMapSpec(t, spec.Maps, "processes", ebpf.Hash, 16, 32, 32768)
+	assertBPFMapSpec(t, spec.Maps, "comm_rules", ebpf.Hash, 24, 16, MaxKernelCommRules*2)
+	assertBPFMapSpec(t, spec.Maps, "active_policy", ebpf.Array, 4, 16, 1)
 	assertBPFMapSpec(t, spec.Maps, "events", ebpf.RingBuf, 0, 0, 1<<24)
-	if len(spec.Maps) != 2 {
-		t.Fatalf("map count = %d, want 2", len(spec.Maps))
+	if len(spec.Maps) != 4 {
+		t.Fatalf("map count = %d, want 4", len(spec.Maps))
+	}
+}
+
+func TestBPFExecUpdatesProcessBeforeRingBufferReservation(t *testing.T) {
+	spec, err := loadMark()
+	if err != nil {
+		t.Fatalf("loadMark() error = %v", err)
+	}
+	program := spec.Programs["handle_sched_process_exec"]
+	if program == nil {
+		t.Fatal("exec program is missing")
+	}
+
+	mapUpdate := -1
+	ringReserve := -1
+	for index, instruction := range program.Instructions {
+		if !instruction.IsBuiltinCall() {
+			continue
+		}
+		switch asm.BuiltinFunc(instruction.Constant) {
+		case asm.FnMapUpdateElem:
+			mapUpdate = index
+		case asm.FnRingbufReserve:
+			ringReserve = index
+		}
+	}
+	if mapUpdate < 0 {
+		t.Fatal("exec program does not update the process map")
+	}
+	if ringReserve < 0 {
+		t.Fatal("exec program does not reserve a ring-buffer event")
+	}
+	if mapUpdate >= ringReserve {
+		t.Fatalf("process map update instruction %d is not before ring-buffer reserve instruction %d", mapUpdate, ringReserve)
 	}
 }
 
@@ -78,6 +115,21 @@ func TestBPFGeneratedTypeLayout(t *testing.T) {
 	}
 	if got := unsafe.Offsetof(markEvent{}.Comm); got != 88 {
 		t.Errorf("event.comm offset = %d, want 88", got)
+	}
+	if got := unsafe.Sizeof(markCommRuleKey{}); got != 24 {
+		t.Errorf("comm_rule_key size = %d, want 24", got)
+	}
+	if got := unsafe.Offsetof(markCommRuleKey{}.Comm); got != 8 {
+		t.Errorf("comm_rule_key.comm offset = %d, want 8", got)
+	}
+	if got := unsafe.Sizeof(markCommRuleValue{}); got != 16 {
+		t.Errorf("comm_rule_value size = %d, want 16", got)
+	}
+	if got := unsafe.Offsetof(markCommRuleValue{}.Mark); got != 8 {
+		t.Errorf("comm_rule_value.mark offset = %d, want 8", got)
+	}
+	if got := unsafe.Sizeof(markKernelPolicyState{}); got != 16 {
+		t.Errorf("kernel_policy_state size = %d, want 16", got)
 	}
 }
 

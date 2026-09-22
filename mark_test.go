@@ -1,6 +1,10 @@
 package pmark
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 func TestPreferProcessValueGenerationBeatsTimestamp(t *testing.T) {
 	old := ProcessValue{
@@ -60,6 +64,41 @@ func TestPreferProcessValuePriorityBeatsInheritanceAndTimestamp(t *testing.T) {
 	got := preferProcessValue(old, next)
 	if got != next {
 		t.Fatalf("preferProcessValue() = %+v, want higher priority %+v", got, next)
+	}
+}
+
+func TestPreferProcessValueOrdering(t *testing.T) {
+	base := ProcessValue{
+		HasMark:     true,
+		Priority:    3,
+		Generation:  4,
+		Inheritance: false,
+		Mark:        40,
+		Timestamp:   50,
+	}
+	tests := []struct {
+		name string
+		old  ProcessValue
+		next ProcessValue
+		want ProcessValue
+	}{
+		{"next tombstone", base, func() ProcessValue { value := base; value.Tombstone = true; return value }(), func() ProcessValue { value := base; value.Tombstone = true; return value }()},
+		{"old tombstone", func() ProcessValue { value := base; value.Tombstone = true; return value }(), base, func() ProcessValue { value := base; value.Tombstone = true; return value }()},
+		{"next generation", base, func() ProcessValue { value := base; value.Generation++; return value }(), func() ProcessValue { value := base; value.Generation++; return value }()},
+		{"old generation", func() ProcessValue { value := base; value.Generation++; return value }(), base, func() ProcessValue { value := base; value.Generation++; return value }()},
+		{"next priority", base, func() ProcessValue { value := base; value.Priority++; return value }(), func() ProcessValue { value := base; value.Priority++; return value }()},
+		{"explicit wins", base, func() ProcessValue { value := base; value.Inheritance = true; return value }(), func() ProcessValue { value := base; value.Inheritance = true; return value }()},
+		{"new timestamp", base, func() ProcessValue { value := base; value.Timestamp++; return value }(), func() ProcessValue { value := base; value.Timestamp++; return value }()},
+		{"equal selects next", base, base, base},
+		{"mark state follows timestamp", base, func() ProcessValue { value := base; value.HasMark = false; value.Timestamp++; return value }(), func() ProcessValue { value := base; value.HasMark = false; value.Timestamp++; return value }()},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := preferProcessValue(tc.old, tc.next); got != tc.want {
+				t.Fatalf("preferProcessValue(%+v, %+v) = %+v, want %+v", tc.old, tc.next, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -277,6 +316,92 @@ func TestHandleEventAcceptsKernelTrackedExitMissingFromMirror(t *testing.T) {
 	}
 }
 
+func TestHandleExecMergesNewerKernelDecisionOverStaleMirror(t *testing.T) {
+	key := ProcessKey{Tgid: 999970, StartTime: 4001}
+	m := &marker{
+		mirror: map[ProcessKey]ProcessValue{
+			key: {HasMark: true, Inheritance: true, Priority: 9, Generation: 2, Mark: 20, Timestamp: 100},
+		},
+		generation: 3,
+		check: func(ProcessInfo) (int8, uint64, bool) {
+			return 1, 30, true
+		},
+	}
+
+	m.handleEvent(markEvent{
+		Type:    eventExec,
+		Key:     key,
+		HasMark: true,
+		Value: ProcessValue{
+			HasMark:     true,
+			Inheritance: true,
+			Priority:    1,
+			Generation:  3,
+			Mark:        30,
+			Timestamp:   200,
+		},
+	})
+
+	got := m.mirror[key]
+	if !got.HasMark || got.Generation != 3 || got.Mark != 30 {
+		t.Fatalf("merged exec value = %+v, want generation 3 mark 30", got)
+	}
+}
+
+func TestHandleExecAcceptsAuthoritativeKernelMiss(t *testing.T) {
+	key := ProcessKey{Tgid: 999969, StartTime: 4002}
+	m := &marker{
+		mirror: map[ProcessKey]ProcessValue{
+			key: {HasMark: true, Inheritance: false, Priority: 8, Generation: 2, Mark: 20, Timestamp: 100},
+		},
+		generation: 3,
+		check:      func(ProcessInfo) (int8, uint64, bool) { return 0, 0, false },
+	}
+
+	m.handleEvent(markEvent{
+		Type: eventExec,
+		Key:  key,
+		Value: ProcessValue{
+			HasMark:    false,
+			Generation: 3,
+			Timestamp:  200,
+		},
+	})
+
+	got := m.mirror[key]
+	if got.HasMark || got.Generation != 3 {
+		t.Fatalf("merged exec value = %+v, want authoritative generation 3 miss", got)
+	}
+}
+
+func TestHandleExecDoesNotReviveKernelTombstone(t *testing.T) {
+	key := ProcessKey{Tgid: 999968, StartTime: 4003}
+	checkCalls := 0
+	logs := 0
+	m := &marker{
+		mirror:     make(map[ProcessKey]ProcessValue),
+		generation: 4,
+		check: func(ProcessInfo) (int8, uint64, bool) {
+			checkCalls++
+			return 1, 40, true
+		},
+		callbacks: Callbacks{Logf: func(string, ...any) { logs++ }},
+	}
+
+	tombstone := ProcessValue{Tombstone: true, HasMark: true, Generation: 3, Mark: 30, Timestamp: 200}
+	m.handleEvent(markEvent{Type: eventExec, Key: key, Value: tombstone})
+
+	if got := m.mirror[key]; got != tombstone {
+		t.Fatalf("exec tombstone = %+v, want %+v", got, tombstone)
+	}
+	if checkCalls != 0 {
+		t.Fatalf("checker calls = %d, want 0", checkCalls)
+	}
+	if logs != 1 {
+		t.Fatalf("diagnostic logs = %d, want 1", logs)
+	}
+}
+
 func TestUpdateHooksReplaysExistingLiveProcessUpdates(t *testing.T) {
 	liveMarked := ProcessKey{Tgid: 101, StartTime: 1001}
 	liveUnmarked := ProcessKey{Tgid: 102, StartTime: 1002}
@@ -473,6 +598,30 @@ func TestCurrentGeneration(t *testing.T) {
 
 	if got := d.CurrentGeneration(); got != 42 {
 		t.Fatalf("CurrentGeneration() = %d, want 42", got)
+	}
+}
+
+func TestProcCommLinePreservesMeaningfulWhitespace(t *testing.T) {
+	tests := map[string]string{
+		"curl\n":     "curl",
+		" curl \n":   " curl ",
+		"line\n\n":   "line\n",
+		"no-newline": "no-newline",
+	}
+	for input, want := range tests {
+		if got := trimProcLine([]byte(input)); got != want {
+			t.Errorf("trimProcLine(%q) = %q, want %q", input, got, want)
+		}
+	}
+
+	path := "/proc/self/comm"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("read %s: %v", path, err)
+	}
+	want := strings.TrimSuffix(string(data), "\n")
+	if got := readProcText(uint32(os.Getpid()), "comm"); got != want {
+		t.Fatalf("readProcText(self, comm) = %q, want %q", got, want)
 	}
 }
 

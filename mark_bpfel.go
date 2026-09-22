@@ -13,6 +13,19 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type markCommRuleKey struct {
+	_          structs.HostLayout
+	Generation uint64
+	Comm       [16]int8
+}
+
+type markCommRuleValue struct {
+	_        structs.HostLayout
+	Priority int8
+	_        [7]byte
+	Mark     uint64
+}
+
 type markEvent struct {
 	_         structs.HostLayout
 	Type      uint32
@@ -25,6 +38,13 @@ type markEvent struct {
 	_         [7]byte
 	Value     markProcessValue
 	Comm      [16]int8
+}
+
+type markKernelPolicyState struct {
+	_          structs.HostLayout
+	Generation uint64
+	Mode       uint8
+	_          [7]byte
 }
 
 type markProcessKey struct {
@@ -97,8 +117,10 @@ type markProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type markMapSpecs struct {
-	Events    *ebpf.MapSpec `ebpf:"events"`
-	Processes *ebpf.MapSpec `ebpf:"processes"`
+	ActivePolicy *ebpf.MapSpec `ebpf:"active_policy"`
+	CommRules    *ebpf.MapSpec `ebpf:"comm_rules"`
+	Events       *ebpf.MapSpec `ebpf:"events"`
+	Processes    *ebpf.MapSpec `ebpf:"processes"`
 }
 
 // markVariableSpecs contains global variables before they are loaded into the kernel.
@@ -127,12 +149,16 @@ func (o *markObjects) Close() error {
 //
 // It can be passed to loadMarkObjects or ebpf.CollectionSpec.LoadAndAssign.
 type markMaps struct {
-	Events    *ebpf.Map `ebpf:"events"`
-	Processes *ebpf.Map `ebpf:"processes"`
+	ActivePolicy *ebpf.Map `ebpf:"active_policy"`
+	CommRules    *ebpf.Map `ebpf:"comm_rules"`
+	Events       *ebpf.Map `ebpf:"events"`
+	Processes    *ebpf.Map `ebpf:"processes"`
 }
 
 func (m *markMaps) Close() error {
 	return _MarkClose(
+		m.ActivePolicy,
+		m.CommRules,
 		m.Events,
 		m.Processes,
 	)

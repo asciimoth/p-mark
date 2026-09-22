@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -75,6 +76,111 @@ func TestDefaultCheckRejectsInvalidRules(t *testing.T) {
 	}
 	if _, err := defaultCheck(defaultCheckRules{RulePPID: `abc`}, 0, 0); err == nil {
 		t.Fatal("expected invalid ppid error")
+	}
+}
+
+func TestCompileDefaultKernelPolicyModes(t *testing.T) {
+	tests := []struct {
+		name         string
+		rules        defaultCheckRules
+		wantMode     core.KernelPolicyMode
+		wantRules    []core.ExactCommRule
+		wantPromoted int
+		wantFallback int
+	}{
+		{
+			name:         "anchored comm is authoritative",
+			rules:        defaultCheckRules{RuleComm: `^curl$`},
+			wantMode:     core.KernelPolicyAuthoritative,
+			wantRules:    []core.ExactCommRule{{Comm: "curl", Priority: 7, Mark: 99}},
+			wantPromoted: 1,
+		},
+		{
+			name:         "empty policy is authoritative",
+			wantMode:     core.KernelPolicyAuthoritative,
+			wantRules:    []core.ExactCommRule{},
+			wantPromoted: 0,
+		},
+		{
+			name:         "mixed comm is positive only",
+			rules:        defaultCheckRules{RuleComm: `^curl$,fire.*`},
+			wantMode:     core.KernelPolicyPositiveOnly,
+			wantRules:    []core.ExactCommRule{{Comm: "curl", Priority: 7, Mark: 99}},
+			wantPromoted: 1,
+			wantFallback: 1,
+		},
+		{
+			name:         "other mark rule makes exact comm positive only",
+			rules:        defaultCheckRules{RuleComm: `^curl$`, RuleExe: `curl$`},
+			wantMode:     core.KernelPolicyPositiveOnly,
+			wantRules:    []core.ExactCommRule{{Comm: "curl", Priority: 7, Mark: 99}},
+			wantPromoted: 1,
+			wantFallback: 1,
+		},
+		{
+			name:         "unsupported policy is userspace only",
+			rules:        defaultCheckRules{RuleComm: `curl`},
+			wantMode:     core.KernelPolicyUserspaceOnly,
+			wantRules:    []core.ExactCommRule{},
+			wantFallback: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := compileDefaultKernelPolicy(tc.rules, 7, 99)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Policy.Mode != tc.wantMode {
+				t.Errorf("mode = %s, want %s", got.Policy.Mode, tc.wantMode)
+			}
+			if len(got.Policy.CommRules) != len(tc.wantRules) {
+				t.Fatalf("rules = %+v, want %+v", got.Policy.CommRules, tc.wantRules)
+			}
+			for index := range tc.wantRules {
+				if got.Policy.CommRules[index] != tc.wantRules[index] {
+					t.Errorf("rule %d = %+v, want %+v", index, got.Policy.CommRules[index], tc.wantRules[index])
+				}
+			}
+			if len(got.Promoted) != tc.wantPromoted || len(got.Fallback) != tc.wantFallback {
+				t.Errorf("promoted/fallback = %v/%v, want counts %d/%d", got.Promoted, got.Fallback, tc.wantPromoted, tc.wantFallback)
+			}
+		})
+	}
+}
+
+func TestCompileDefaultKernelPolicyKeepsUserspaceSemantics(t *testing.T) {
+	compiled, err := compileDefaultKernelPolicy(defaultCheckRules{
+		RuleComm: `^curl$,fire.*`,
+		RuleCmd:  `--proxy`,
+	}, -3, 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, info := range []core.ProcessInfo{
+		{Comm: "curl"},
+		{Comm: "firefox"},
+		{Cmdline: "tool --proxy value"},
+	} {
+		priority, mark, ok := compiled.Check(info)
+		if !ok || priority != -3 || mark != 123 {
+			t.Errorf("check(%+v) = %d, %d, %v; want -3, 123, true", info, priority, mark, ok)
+		}
+	}
+	if _, _, ok := compiled.Check(core.ProcessInfo{Comm: "bash"}); ok {
+		t.Fatal("compiled check matched unrelated process")
+	}
+}
+
+func TestCompileDefaultKernelPolicyRejectsPromotedRuleOverflow(t *testing.T) {
+	patterns := make([]string, 0, core.MaxKernelCommRules+1)
+	for index := 0; index <= core.MaxKernelCommRules; index++ {
+		patterns = append(patterns, fmt.Sprintf("^r%04d$", index))
+	}
+	_, err := compileDefaultKernelPolicy(defaultCheckRules{RuleComm: strings.Join(patterns, ",")}, 0, 0)
+	if err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("compileDefaultKernelPolicy() error = %v, want rule limit error", err)
 	}
 }
 

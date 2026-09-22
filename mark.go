@@ -35,7 +35,7 @@ const (
 	DefaultTombTTL = time.Minute
 )
 
-var pinnedMapNames = []string{"processes", "events"}
+var pinnedMapNames = []string{"processes", "comm_rules", "active_policy", "events"}
 
 // ProcessKey is the per-boot process-lifetime identity shared with BPF.
 //
@@ -83,7 +83,7 @@ type ProcessInfo struct {
 //
 // It is called while the daemon walks the current /proc tree before attaching
 // BPF programs, again immediately after attach to cover the race window, and on
-// each fork event for the child process. It is not called on exit events.
+// each fork and exec event. It is not called on exit events.
 //
 // Returning (priority, mark, true) creates or refreshes an explicit live mark
 // for the supplied process in the current checker generation. Returning (_, _,
@@ -251,11 +251,16 @@ func NewDaemon(
 		tombTTL:              tombTTL,
 	}
 	d.marker = &marker{
-		processes:  objs.Processes,
-		mirror:     make(map[ProcessKey]ProcessValue),
-		check:      check,
-		generation: 1,
-		callbacks:  callbacks,
+		processes:          objs.Processes,
+		commRules:          objs.CommRules,
+		activePolicy:       objs.ActivePolicy,
+		mirror:             make(map[ProcessKey]ProcessValue),
+		check:              check,
+		generation:         1,
+		policyGeneration:   1,
+		kernelPolicy:       KernelPolicy{Mode: KernelPolicyUserspaceOnly},
+		callbacks:          callbacks,
+		installedCommRules: make(map[uint64][]markCommRuleKey),
 
 		tombTTL: tombTTL,
 	}
@@ -341,6 +346,23 @@ func (d *Daemon) SetChecker(check CheckFunc) (uint64, error) {
 		check = func(ProcessInfo) (int8, uint64, bool) { return 0, 0, false }
 	}
 	return d.marker.setChecker(check)
+}
+
+// SetKernelPolicy atomically installs a generation-qualified exact comm policy
+// and the userspace checker that represents the complete policy.
+//
+// In authoritative mode, callers must ensure that check returns the same mark
+// decision as CommRules. A nil check uses an exact matcher built from CommRules.
+// In positive-only mode, check can also evaluate rules that cannot run in BPF.
+// Existing SetChecker callers stay in userspace-only mode.
+func (d *Daemon) SetKernelPolicy(policy KernelPolicy, check CheckFunc) (uint64, error) {
+	return d.marker.setKernelPolicy(policy, check)
+}
+
+// KernelPolicyState returns the active kernel policy mode, generation, and
+// normalized exact-rule count.
+func (d *Daemon) KernelPolicyState() KernelPolicyStatus {
+	return d.marker.kernelPolicyState()
 }
 
 // SetProcessMark explicitly sets a live mark for one process lifetime.
@@ -477,11 +499,19 @@ func GrabProcessMapState(pinPath string) (ProcessMapState, error) {
 type marker struct {
 	mu           sync.Mutex
 	processes    *ebpf.Map
+	commRules    bpfMapMutator
+	activePolicy bpfMapMutator
 	mirror       map[ProcessKey]ProcessValue
 	check        CheckFunc
 	generation   uint64
-	callbacks    Callbacks
-	eventCounter uint64
+	// policyGeneration also advances for failed map transactions. This avoids
+	// activating stale keys if rollback deletion cannot remove a partial set.
+	policyGeneration uint64
+	kernelPolicy     KernelPolicy
+	callbacks        Callbacks
+	eventCounter     uint64
+
+	installedCommRules map[uint64][]markCommRuleKey
 
 	tombTTL time.Duration
 }
@@ -648,12 +678,26 @@ func (m *marker) handleEvent(event markEvent) {
 		value := event.Value
 		hasValue := false
 
-		if existing, ok := m.mirror[event.Key]; ok && !existing.Tombstone {
+		/*
+		 * The exec program can make an authoritative synchronous decision. Merge
+		 * that value with the mirror by the shared precedence rules. A stale live
+		 * mirror value must not erase the kernel's newer generation.
+		 */
+		if event.Value != (ProcessValue{}) {
+			m.upsertProcessWithLog(event.Key, event.Value, false)
+			value = m.mirror[event.Key]
+			hasValue = true
+		}
+		if existing, ok := m.mirror[event.Key]; ok {
 			value = existing
 			hasValue = true
-		} else if event.HasMark && event.Value.HasMark {
-			value = event.Value
-			hasValue = true
+			if value != event.Value {
+				m.syncKernel(event.Key, value)
+			}
+		}
+		if value.Tombstone {
+			m.logf("exec observed tombstone for live identity pid=%d start_time=%d; preserving tombstone", event.Key.Tgid, event.Key.StartTime)
+			return
 		}
 
 		if priority, mark, ok := m.check(info); ok {
@@ -703,11 +747,18 @@ func (m *marker) traverseProcessTree() error {
 }
 
 func (m *marker) traverseProcessTreeLocked() error {
+	if err := m.refreshMirrorFromKernelLocked(); err != nil {
+		return fmt.Errorf("refresh userspace mirror from process map: %w", err)
+	}
 	procs, err := listProcesses()
 	if err != nil {
 		return err
 	}
+	m.traverseProcessesLocked(procs)
+	return nil
+}
 
+func (m *marker) traverseProcessesLocked(procs []ProcessInfo) {
 	byParent := make(map[uint32][]ProcessInfo)
 	byPID := make(map[uint32]ProcessInfo)
 	for _, proc := range procs {
@@ -775,15 +826,42 @@ func (m *marker) traverseProcessTreeLocked() error {
 		}
 	}
 	m.logf("process traversal complete: procs=%d mirror_entries=%d live_marked=%d", len(procs), len(m.mirror), liveMarked)
+}
+
+func (m *marker) refreshMirrorFromKernelLocked() error {
+	if m.processes == nil {
+		return nil
+	}
+
+	type repair struct {
+		key   ProcessKey
+		value ProcessValue
+	}
+	repairs := make([]repair, 0)
+	var key ProcessKey
+	var kernelValue ProcessValue
+	iter := m.processes.Iterate()
+	for iter.Next(&key, &kernelValue) {
+		value := kernelValue
+		if mirrorValue, ok := m.mirror[key]; ok {
+			value = preferProcessValue(mirrorValue, kernelValue)
+		}
+		m.mirror[key] = value
+		if value != kernelValue {
+			repairs = append(repairs, repair{key: key, value: value})
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	for _, item := range repairs {
+		m.syncKernel(item.key, item.value)
+	}
 	return nil
 }
 
 func (m *marker) setChecker(check CheckFunc) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.check = check
-	return m.bumpGenerationLocked()
+	return m.setKernelPolicy(KernelPolicy{Mode: KernelPolicyUserspaceOnly}, check)
 }
 
 func (m *marker) setProcessMark(key ProcessKey, priority int8, mark uint64) {
@@ -801,11 +879,7 @@ func (m *marker) bumpGeneration() (uint64, error) {
 }
 
 func (m *marker) bumpGenerationLocked() (uint64, error) {
-	m.generation++
-	if m.generation == 0 {
-		m.generation = 1
-	}
-	return m.generation, m.traverseProcessTreeLocked()
+	return m.setKernelPolicyLocked(m.kernelPolicy, m.check)
 }
 
 func (m *marker) currentGeneration() uint64 {
@@ -813,6 +887,17 @@ func (m *marker) currentGeneration() uint64 {
 	defer m.mu.Unlock()
 
 	return m.generation
+}
+
+func (m *marker) kernelPolicyState() KernelPolicyStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return KernelPolicyStatus{
+		Generation: m.generation,
+		Mode:       m.kernelPolicy.Mode,
+		RuleCount:  len(m.kernelPolicy.CommRules),
+	}
 }
 
 func (m *marker) updateHooks(callbacks Callbacks) {
@@ -1154,7 +1239,11 @@ func readProcText(pid uint32, name string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	return trimProcLine(data)
+}
+
+func trimProcLine(data []byte) string {
+	return strings.TrimSuffix(string(data), "\n")
 }
 
 func readProcCmdline(pid uint32) string {

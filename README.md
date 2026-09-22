@@ -76,6 +76,15 @@ route. The userspace reconciler also attempts to update sockets that were
 already open. If a connect hook finds a required process mark but cannot apply
 it, the hook rejects the connection. The caller normally receives `EPERM`.
 
+The daemon promotes a fully anchored, case-sensitive literal `comm` regexp,
+such as `^curl$`, to an in-kernel exec rule. When every mark-producing rule can
+be promoted, the policy is `authoritative`: the exec tracepoint writes the
+matching or non-matching result to the process map before the new program can
+create its first socket. Mixed policies use `positive-only` mode, and policies
+without a promotable rule use `userspace-only` mode. Startup logs and
+`GET /state` report the active mode. Other regexp forms and `cmdline`, `exe`,
+and PPID rules continue to run in userspace.
+
 ### Launching The Watcher
 The watcher does not run the marking logic. It opens the pinned `processes` map 
 and prints the currently marked process tree:
@@ -235,6 +244,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if _, err := daemon.SetKernelPolicy(pmark.KernelPolicy{
+		Mode: pmark.KernelPolicyAuthoritative,
+		CommRules: []pmark.ExactCommRule{
+			{Comm: "firefox", Priority: 10, Mark: 0x0000004200000001},
+		},
+	}, nil); err != nil {
+		log.Fatal(err)
+	}
 
 	if err := daemon.Run(); err != nil {
 		log.Fatal(err)
@@ -255,7 +272,11 @@ Important API points:
 - Returning `ok=false` leaves the process unmarked unless a live parent mark can
   be inherited.
 - `SetChecker` replaces rule logic, bumps the checker generation, and
-  re-traverses `/proc`.
+  re-traverses `/proc`. It explicitly selects `userspace-only` mode.
+- `SetKernelPolicy` installs generation-qualified exact `comm` rules and the
+  userspace checker in one transaction. A nil checker uses an equivalent exact
+  matcher built from the supplied rules.
+- `KernelPolicyState` reports the active mode, generation, and rule count.
 - `ForceProcessTraversal` re-checks current processes without bumping the
   generation.
 - `GrabProcessMapState` is useful for admin panels and watchers.
@@ -334,6 +355,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if _, err := daemon.SetKernelPolicy(pmark.KernelPolicy{
+		Mode: pmark.KernelPolicyAuthoritative,
+		CommRules: []pmark.ExactCommRule{
+			{Comm: "firefox", Mark: mark},
+		},
+	}, nil); err != nil {
+		log.Fatal(err)
+	}
 
 	manager, err := fwmark.NewManager(pinPath, log.Printf)
 	if err != nil {
@@ -369,8 +398,9 @@ marks change.
 ## Architecture
 ### General Working Principle
 `p-mark` splits policy from propagation:
-- Userspace owns policy. Go callbacks inspect `/proc` metadata and decide which
-  process receive explicit marks.
+- Userspace owns general policy. Go callbacks inspect `/proc` metadata and
+  decide which processes receive explicit marks. Exact `comm` policies can also
+  run synchronously in the exec BPF program.
 - Kernel eBPF owns fast propagation. Tracepoint programs observe fork, exec, and
   exit transitions and maintain/emit effective mark state.
 - A pinned BPF hash map named `processes` is the shared state between the root
@@ -381,8 +411,11 @@ Process identity is not just PID. The key is `(tgid, start_time)`, where
 PID-reuse confusion for one boot.
 
 ### pmark pkg
-`NewDaemon` loads the generated eBPF object, pins `processes` and `events` under
-the configured bpffs directory, and prepares a userspace mirror. `Run` then:
+`NewDaemon` loads the generated eBPF object and pins `processes`, `comm_rules`,
+`active_policy`, and `events` under the configured bpffs directory. The daemon
+removes these known pins at startup because their layouts are one versioned ABI
+and stale layouts cannot be reused safely. It also prepares a userspace mirror.
+`Run` then:
 
 1. Traverses `/proc` before attaching programs and applies `CheckFunc`.
 2. Attaches tracepoint programs for `sched_process_fork`,
@@ -396,8 +429,21 @@ event. Userspace then reconciles that result with its mirror and calls
 `CheckFunc` for the child. If the checker returns a mark, that explicit mark can
 override inheritance according to normal merge rules.
 
-On exec, BPF reports the current effective value. Userspace can re-check process
-metadata because `cmdline` and `exe` may have changed.
+On exec, BPF reads `active_policy` once and looks up the current task name in
+the generation-qualified `comm_rules` map. A match writes an explicit value to
+`processes`. An authoritative miss writes a live no-mark value when an old or
+inherited value exists. A miss without existing state stays absent because a
+missing entry already means unmarked. The update occurs before ring-buffer
+reservation, so a full buffer cannot delay the decision. Userspace merges the
+event value with its mirror and can re-check metadata because `cmdline` and
+`exe` may have changed.
+
+Policy updates first populate a complete inactive rule generation. They then
+switch the one-entry `active_policy` map and remove inactive rules. An exec can
+therefore observe a complete old generation or a complete new generation.
+Failed transactions do not reuse their generation, so a failed rollback cannot
+make a partial rule set active later. Generation zero is reserved. The daemon
+returns an error instead of wrapping after generation `2^64-1`.
 
 On exit, entries become tombstones instead of immediate deletes. Tombstones keep
 late events for the same process lifetime from reviving stale marks. The daemon

@@ -83,10 +83,11 @@ func main() {
 		RuleExe:  *ruleExe,
 		RulePPID: *rulePPID,
 	}
-	nameCheck, err := defaultCheck(checkRules, priority, *markValue)
+	compiledPolicy, err := compileDefaultKernelPolicy(checkRules, priority, *markValue)
 	if err != nil {
-		log.Fatal("Creating default checker:", err)
+		log.Fatal("Creating default policy:", err)
 	}
+	nameCheck := compiledPolicy.Check
 	ruleTracker := newMultiRuleManager()
 	for _, spec := range cliMultiRules {
 		rules, err := parseMultiRuleCLI(spec)
@@ -113,6 +114,15 @@ func main() {
 	if err != nil {
 		log.Fatal("Creating daemon:", err)
 	}
+	if _, err := daemon.SetKernelPolicy(compiledPolicy.Policy, check); err != nil {
+		log.Fatal("Installing kernel policy:", err)
+	}
+	log.Printf(
+		"Kernel policy mode=%s promoted_comm=%q fallback_rules=%q",
+		compiledPolicy.Policy.Mode,
+		compiledPolicy.Promoted,
+		compiledPolicy.Fallback,
+	)
 
 	if *enableFWMark {
 		fwmarks, err := fwmark.NewManager(*pinPath, log.Printf)
@@ -193,8 +203,7 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonCon
 	config.HTTPAddr = listener.Addr().String()
 
 	var controlMu sync.Mutex
-	nameCheck, err := defaultCheck(config.Rules, config.MarkPriority, config.MarkValue)
-	if err != nil {
+	if _, err := compileDefaultKernelPolicy(config.Rules, config.MarkPriority, config.MarkValue); err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
@@ -210,10 +219,8 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonCon
 	})
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {
 		controlMu.Lock()
-		stateConfig := config
+		state, err := daemonControlState(daemon, config, ruleTracker)
 		controlMu.Unlock()
-
-		state, err := daemonControlState(daemon, stateConfig, ruleTracker)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -235,18 +242,26 @@ func startDaemonControlServer(addr string, daemon *core.Daemon, config daemonCon
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		nextCheck, err := defaultCheck(update.Rules, update.MarkPriority, update.MarkValue)
+		nextPolicy, err := compileDefaultKernelPolicy(update.Rules, update.MarkPriority, update.MarkValue)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		controlMu.Lock()
-		nameCheck = nextCheck
-		_, err = daemon.SetChecker(combinedCheck(ruleTracker.Tracker(), nameCheck))
+		_, err = daemon.SetKernelPolicy(
+			nextPolicy.Policy,
+			combinedCheck(ruleTracker.Tracker(), nextPolicy.Check),
+		)
 		if err == nil {
 			config.Rules = update.Rules
 			config.MarkPriority = update.MarkPriority
 			config.MarkValue = update.MarkValue
+			log.Printf(
+				"Kernel policy mode=%s promoted_comm=%q fallback_rules=%q",
+				nextPolicy.Policy.Mode,
+				nextPolicy.Promoted,
+				nextPolicy.Fallback,
+			)
 		}
 		controlMu.Unlock()
 		if err != nil {
@@ -339,6 +354,11 @@ func daemonControlState(daemon *core.Daemon, config daemonControlConfig, ruleTra
 		return jsonDaemonState{}, err
 	}
 	ruleMatches := ruleTracker.Snapshot()
+	policy := daemon.KernelPolicyState()
+	compiledPolicy, err := compileDefaultKernelPolicy(config.Rules, config.MarkPriority, config.MarkValue)
+	if err != nil {
+		return jsonDaemonState{}, err
+	}
 
 	entries := make([]jsonProcessMapEntry, 0, len(snapshot.Entries))
 	for key, value := range snapshot.Entries {
@@ -375,7 +395,20 @@ func daemonControlState(daemon *core.Daemon, config daemonControlConfig, ruleTra
 		RefreshedAt: time.Now().Format(time.RFC3339),
 		Config:      config,
 		Dynamic: jsonDaemonDynamicState{
-			Generation: daemon.CurrentGeneration(),
+			Generation: policy.Generation,
+			KernelPolicy: jsonKernelPolicy{
+				Mode:       policy.Mode.String(),
+				Generation: policy.Generation,
+				RuleCount:  policy.RuleCount,
+				PromotedComm: append(
+					[]string{},
+					compiledPolicy.Promoted...,
+				),
+				FallbackRules: append(
+					[]string{},
+					compiledPolicy.Fallback...,
+				),
+			},
 			ProcessMap: jsonProcessMapState{
 				Alive:      snapshot.Alive,
 				Tombstones: snapshot.Tombstones,
@@ -860,6 +893,71 @@ func defaultCheck(rules defaultCheckRules, markPriority int8, markValue uint64) 
 	}, nil
 }
 
+type compiledDefaultKernelPolicy struct {
+	Policy   core.KernelPolicy
+	Check    core.CheckFunc
+	Promoted []string
+	Fallback []string
+}
+
+func compileDefaultKernelPolicy(
+	rules defaultCheckRules,
+	markPriority int8,
+	markValue uint64,
+) (compiledDefaultKernelPolicy, error) {
+	check, err := defaultCheck(rules, markPriority, markValue)
+	if err != nil {
+		return compiledDefaultKernelPolicy{}, err
+	}
+
+	compiled := compiledDefaultKernelPolicy{Check: check}
+	for _, pattern := range splitRegexpList(rules.RuleComm) {
+		comm, supported, err := core.ExactCommFromRegexp(pattern)
+		if err != nil {
+			return compiledDefaultKernelPolicy{}, fmt.Errorf("compile rule_comm %q: %w", pattern, err)
+		}
+		if !supported {
+			compiled.Fallback = append(compiled.Fallback, "rule_comm="+pattern)
+			continue
+		}
+		compiled.Policy.CommRules = append(compiled.Policy.CommRules, core.ExactCommRule{
+			Comm:     comm,
+			Priority: markPriority,
+			Mark:     markValue,
+		})
+		compiled.Promoted = append(compiled.Promoted, pattern)
+	}
+	for _, item := range []struct {
+		name  string
+		value string
+	}{
+		{"rule_cmd", rules.RuleCmd},
+		{"rule_exe", rules.RuleExe},
+		{"rule_ppid", rules.RulePPID},
+	} {
+		for _, value := range splitRegexpList(item.value) {
+			compiled.Fallback = append(compiled.Fallback, item.name+"="+value)
+		}
+	}
+
+	switch {
+	case len(compiled.Fallback) == 0:
+		compiled.Policy.Mode = core.KernelPolicyAuthoritative
+	case len(compiled.Policy.CommRules) != 0:
+		compiled.Policy.Mode = core.KernelPolicyPositiveOnly
+	default:
+		compiled.Policy.Mode = core.KernelPolicyUserspaceOnly
+	}
+	if len(compiled.Policy.CommRules) > core.MaxKernelCommRules {
+		return compiledDefaultKernelPolicy{}, fmt.Errorf(
+			"kernel policy has %d promoted comm rules; maximum is %d",
+			len(compiled.Policy.CommRules),
+			core.MaxKernelCommRules,
+		)
+	}
+	return compiled, nil
+}
+
 type defaultCheckMatcher struct {
 	comm []*regexp.Regexp
 	cmd  []*regexp.Regexp
@@ -893,13 +991,9 @@ func compileDefaultCheckRules(rules defaultCheckRules) (defaultCheckMatcher, err
 }
 
 func compileRegexpList(name, value string) ([]*regexp.Regexp, error) {
-	parts := strings.Split(value, ",")
+	parts := splitRegexpList(value)
 	out := make([]*regexp.Regexp, 0, len(parts))
 	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
 		re, err := regexp.Compile(part)
 		if err != nil {
 			return nil, fmt.Errorf("compile %s %q: %w", name, part, err)
@@ -907,6 +1001,17 @@ func compileRegexpList(name, value string) ([]*regexp.Regexp, error) {
 		out = append(out, re)
 	}
 	return out, nil
+}
+
+func splitRegexpList(value string) []string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func parsePPIDRules(value string) (map[uint32]bool, error) {
