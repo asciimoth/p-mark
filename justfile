@@ -1,18 +1,24 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set dotenv-load := true
 
-check: typos test-total
+check: typos lint-ebpf test-total
 
 generate:
   go generate ./...
 
+lint-ebpf:
+  ./scripts/check-ebpf.sh
+
 test:
   go test ./... -count=1
+
+test-ebpf:
+  go test . ./fwmark -run BPF -count=1
 
 test-e2e:
   ./e2e/run.sh
 
-test-total: test test-e2e
+test-total: test test-e2e test-ebpf
 
 build: generate
   go build -o ./pmark ./cmd

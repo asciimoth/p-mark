@@ -1,0 +1,13 @@
+BasedOnStyle: LLVM
+UseTab: Always
+TabWidth: 8
+IndentWidth: 8
+ContinuationIndentWidth: 8
+BreakBeforeBraces: Linux
+ColumnLimit: 120
+SortIncludes: Never
+PointerAlignment: Right
+AllowShortFunctionsOnASingleLine: None
+SpacesInLineCommentPrefix:
+  Minimum: 0
+  Maximum: -1

@@ -176,6 +176,7 @@
           just
 
           bpfClang
+          llvm.clang-tools # clang-format and clang-tidy
           llvm.llvm
 
           linuxHeaders # linux/bpf.h

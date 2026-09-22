@@ -174,6 +174,19 @@ Run the unit tests:
 just test
 ```
 
+Run only the unprivileged tests for the embedded eBPF specifications and C ABI:
+
+```sh
+just test-ebpf
+```
+
+Check C formatting and static analysis, compile both eBPF byte orders with
+strict warnings, and check that the committed `bpf2go` artifacts are current:
+
+```sh
+just lint-ebpf
+```
+
 Run the privileged Docker end-to-end suite:
 
 ```sh
