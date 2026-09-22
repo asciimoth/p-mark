@@ -1,0 +1,6 @@
+.git
+.direnv
+dist
+e2e/coverage
+pmark
+

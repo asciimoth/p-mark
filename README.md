@@ -166,6 +166,24 @@ Release archives and package artifacts are published on the
 ### Arch
 [AUR](https://aur.archlinux.org/packages/pmark-bin) is available
 
+## Testing
+
+Run the unit tests:
+
+```sh
+just test
+```
+
+Run the privileged Docker end-to-end suite:
+
+```sh
+just test-e2e
+```
+
+The end-to-end tests use eBPF, bpffs, the host PID namespace, and cgroup socket
+hooks. See [`e2e/README.md`](./e2e/README.md) for the host requirements, case
+layout, image cache, and coverage options.
+
 ## Library Usage
 Note: You can find more marks usage examples in [ebpf-test](https://github.com/asciimoth/ebpf-test)
 

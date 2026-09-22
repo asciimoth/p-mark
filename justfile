@@ -1,11 +1,18 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set dotenv-load := true
 
+check: typos test-total
+
 generate:
   go generate ./...
 
 test:
   go test ./... -count=1
+
+test-e2e:
+  ./e2e/run.sh
+
+test-total: test test-e2e
 
 build: generate
   go build -o ./pmark ./cmd
@@ -18,6 +25,9 @@ watcher: build
 
 help: build
   ./pmark --help
+
+typos:
+  typos
 
 release-check-env:
 	@missing=0; \
@@ -40,4 +50,3 @@ release-snapshot: release-check-env
 release: release-check-env
 	SSH_BIN="${SSH_BIN:-$(command -v ssh)}" goreleaser release --clean --skip=validate
 	"$MYREPO/maintain" save feat "add pmark $(git describe --tags --abbrev=0)"
-
