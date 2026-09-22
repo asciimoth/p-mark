@@ -74,6 +74,8 @@ type fwmarkSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type fwmarkProgramSpecs struct {
+	FwmarkConnect4   *ebpf.ProgramSpec `ebpf:"fwmark_connect4"`
+	FwmarkConnect6   *ebpf.ProgramSpec `ebpf:"fwmark_connect6"`
 	FwmarkSockCreate *ebpf.ProgramSpec `ebpf:"fwmark_sock_create"`
 }
 
@@ -129,11 +131,15 @@ type fwmarkVariables struct {
 //
 // It can be passed to loadFwmarkObjects or ebpf.CollectionSpec.LoadAndAssign.
 type fwmarkPrograms struct {
+	FwmarkConnect4   *ebpf.Program `ebpf:"fwmark_connect4"`
+	FwmarkConnect6   *ebpf.Program `ebpf:"fwmark_connect6"`
 	FwmarkSockCreate *ebpf.Program `ebpf:"fwmark_sock_create"`
 }
 
 func (p *fwmarkPrograms) Close() error {
 	return _FwmarkClose(
+		p.FwmarkConnect4,
+		p.FwmarkConnect6,
 		p.FwmarkSockCreate,
 	)
 }

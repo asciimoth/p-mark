@@ -38,6 +38,12 @@ type SocketMarkReport struct {
 	PermissionSkipped int
 }
 
+type cgroupProgram struct {
+	name    string
+	attach  ebpf.AttachType
+	program *ebpf.Program
+}
+
 // NewManager loads fwmark programs, reuses core's pinned processes map, and
 // attaches cgroup hooks to the root cgroup.
 func NewManager(pinPath string, logf func(format string, args ...any)) (*Manager, error) {
@@ -66,26 +72,26 @@ func NewManager(pinPath string, logf func(format string, args ...any)) (*Manager
 }
 
 func (m *Manager) attach(cgroupPath string) error {
-	programs := []struct {
-		name    string
-		attach  ebpf.AttachType
-		program *ebpf.Program
-	}{
-		{"cgroup/sock_create", ebpf.AttachCGroupInetSockCreate, m.objs.FwmarkSockCreate},
-	}
-
-	for _, item := range programs {
+	for _, item := range m.cgroupPrograms() {
 		l, err := link.AttachCgroup(link.CgroupOptions{
 			Path:    cgroupPath,
 			Attach:  item.attach,
 			Program: item.program,
 		})
 		if err != nil {
-			return fmt.Errorf("attach %s to %s: %w", item.name, cgroupPath, err)
+			return fmt.Errorf("attach program %s with type %s to cgroup %s: %w", item.name, item.attach, cgroupPath, err)
 		}
 		m.links = append(m.links, l)
 	}
 	return nil
+}
+
+func (m *Manager) cgroupPrograms() []cgroupProgram {
+	return []cgroupProgram{
+		{"cgroup/sock_create", ebpf.AttachCGroupInetSockCreate, m.objs.FwmarkSockCreate},
+		{"cgroup/connect4", ebpf.AttachCGroupInet4Connect, m.objs.FwmarkConnect4},
+		{"cgroup/connect6", ebpf.AttachCGroupInet6Connect, m.objs.FwmarkConnect6},
+	}
 }
 
 func (m *Manager) Close() error {

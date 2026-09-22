@@ -93,19 +93,32 @@ int fwmark_sock_create(struct bpf_sock *ctx)
 	return 1;
 }
 
-// TODO: Maybe we should use cgroup/connect* and cgroup/sendmsg* too?
-//
-// SEC("cgroup/connect4")
-// int fwmark_connect4(struct bpf_sock_addr *ctx)
-// {
-// 	return 1;
-// }
-//
-// SEC("cgroup/connect6")
-// int fwmark_connect6(struct bpf_sock_addr *ctx)
-// {
-// 	return 1;
-// }
+static __always_inline int apply_current_process_fwmark(struct bpf_sock_addr *ctx)
+{
+	__u32 fwmark;
+
+	if (!current_process_fwmark(&fwmark)) {
+		return 1;
+	}
+
+	// Reject the connection if a required mark cannot be applied. Allowing the
+	// connection would let its first route lookup use an unmarked route.
+	return bpf_setsockopt(ctx, SOL_SOCKET, SO_MARK, &fwmark, sizeof(fwmark)) == 0;
+}
+
+SEC("cgroup/connect4")
+int fwmark_connect4(struct bpf_sock_addr *ctx)
+{
+	return apply_current_process_fwmark(ctx);
+}
+
+SEC("cgroup/connect6")
+int fwmark_connect6(struct bpf_sock_addr *ctx)
+{
+	return apply_current_process_fwmark(ctx);
+}
+
+// TODO: Maybe we should use cgroup/sendmsg* too?
 //
 // SEC("cgroup/sendmsg4")
 // int fwmark_sendmsg4(struct bpf_sock_addr *ctx)

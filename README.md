@@ -69,8 +69,12 @@ fwmark:
 sudo ./pmark -fwmark -fmark-value 0xeb9f0001
 ```
 
-With `-fwmark`, new sockets created by marked processes receive the fwmark, and
-the userspace reconciler attempts to update sockets that were already open.
+With `-fwmark`, marked processes receive the fwmark through three cgroup hooks:
+`sock_create` handles the normal socket-creation path, and `connect4` and
+`connect6` repair the mark immediately before a connected socket selects its
+route. The userspace reconciler also attempts to update sockets that were
+already open. If a connect hook finds a required process mark but cannot apply
+it, the hook rejects the connection. The caller normally receives `EPERM`.
 
 ### Launching The Watcher
 The watcher does not run the marking logic. It opens the pinned `processes` map 
@@ -401,18 +405,31 @@ periodically removes old tombstones from both the userspace mirror and kernel
 map.
 
 ### fwmark pkg
-`fwmark` loads a cgroup `sock_create` eBPF program and attaches it to the root
-cgroup. When a process creates a socket, the program computes the current
-process key, looks up `processes`, and if the entry is live and marked, writes:
+`fwmark` loads cgroup `sock_create`, `connect4`, and `connect6` eBPF programs
+and attaches them to the root cgroup. When a process creates a socket, the
+`sock_create` program computes the current process key, looks up `processes`,
+and if the entry is live and marked, writes:
 
 ```text
 socket fwmark = process mark >> 32
 ```
 
-That covers sockets created after the mark is present. Existing sockets need
-userspace help. `fwmark.Manager.ProcessUpdateCallback` returns a
-`pmark.ProcessUpdate` hook that walks `/proc/<pid>/fd`, obtains each target fd
-through `pidfd_getfd`, and applies `SO_MARK` with `setsockopt`.
+The connect programs repeat this lookup for IPv4 and IPv6 connections and use
+`bpf_setsockopt(SO_MARK)` before the first route lookup. They repair a socket
+that was created before its process-map entry was ready or that a userspace
+descriptor scan missed. If a required `SO_MARK` update fails, the program
+rejects the connection instead of allowing an unmarked route.
+
+Existing sockets still need userspace help. `fwmark.Manager.ProcessUpdateCallback`
+returns a `pmark.ProcessUpdate` hook that walks `/proc/<pid>/fd`, obtains each
+target fd through `pidfd_getfd`, and applies `SO_MARK` with `setsockopt`. This
+also clears marks after a process stops matching and updates sockets before
+they connect.
+
+Process matching after `exec` still runs in userspace. A connection that starts
+before userspace adds its process-map entry cannot be repaired by the connect
+hooks. Unconnected UDP `sendto()` and `sendmsg()` traffic is also outside these
+hooks.
 
 ### eBPF processes Map
 The `processes` map is a pinned `BPF_MAP_TYPE_HASH` named `processes`.

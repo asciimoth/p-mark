@@ -1,6 +1,59 @@
 package fwmark
 
-import "testing"
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/cilium/ebpf"
+)
+
+func TestManagerCgroupPrograms(t *testing.T) {
+	sockCreate := new(ebpf.Program)
+	connect4 := new(ebpf.Program)
+	connect6 := new(ebpf.Program)
+	manager := Manager{
+		objs: fwmarkObjects{
+			fwmarkPrograms: fwmarkPrograms{
+				FwmarkSockCreate: sockCreate,
+				FwmarkConnect4:   connect4,
+				FwmarkConnect6:   connect6,
+			},
+		},
+	}
+
+	want := []cgroupProgram{
+		{"cgroup/sock_create", ebpf.AttachCGroupInetSockCreate, sockCreate},
+		{"cgroup/connect4", ebpf.AttachCGroupInet4Connect, connect4},
+		{"cgroup/connect6", ebpf.AttachCGroupInet6Connect, connect6},
+	}
+	got := manager.cgroupPrograms()
+	if len(got) != len(want) {
+		t.Fatalf("program count = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("program %d = %#v, want %#v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManagerAttachErrorIncludesProgramTypeAndCgroup(t *testing.T) {
+	cgroupPath := filepath.Join(t.TempDir(), "missing-cgroup")
+	err := (&Manager{}).attach(cgroupPath)
+	if err == nil {
+		t.Fatal("attach() error = nil, want an error")
+	}
+	for _, want := range []string{
+		"cgroup/sock_create",
+		ebpf.AttachCGroupInetSockCreate.String(),
+		cgroupPath,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("attach() error = %q, want it to contain %q", err, want)
+		}
+	}
+}
 
 func TestFromMarkUsesHigh32Bits(t *testing.T) {
 	mark := uint64(0x12345678abcdef01)
