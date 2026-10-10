@@ -34,6 +34,11 @@ start_daemon \
 	-mark-priority 7 \
 	-mark-value 123456789
 
+state | jq -e '
+	.dynamic.kernel_policy.mode == "userspace-only"
+	and (.dynamic.kernel_policy.fallback_rules | length) > 0
+' >/dev/null || fail "PPID fallback policy was not reported as userspace-only"
+
 child_file="$E2E_RUNTIME/child.pid"
 e2e-life -c '(echo "$BASHPID" >"$1"; while :; do read -r -t 1 _ || true; done) & wait' _ "$child_file" &
 target_pid="$!"

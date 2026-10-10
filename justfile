@@ -18,6 +18,9 @@ test-ebpf:
 test-e2e:
   ./e2e/run.sh
 
+test-e2e-guest *cases:
+  ./e2e/guest/run.sh {{cases}}
+
 test-total: test test-e2e test-ebpf
 
 build: generate

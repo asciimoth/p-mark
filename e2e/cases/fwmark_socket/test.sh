@@ -30,9 +30,14 @@ import time
 runtime = pathlib.Path(os.environ["E2E_RUNTIME"])
 expected = int(os.environ["E2E_EXPECTED_FWMARK"], 0)
 existing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+existing_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-if existing.getsockopt(socket.SOL_SOCKET, socket.SO_MARK) != 0:
-    raise SystemExit("socket was marked before the rule matched")
+for description, probe in {
+    "TCP socket": existing,
+    "UDP socket": existing_udp,
+}.items():
+    if probe.getsockopt(socket.SOL_SOCKET, socket.SO_MARK) != 0:
+        raise SystemExit(f"{description} was marked before the rule matched")
 runtime.joinpath("ready").touch()
 
 
@@ -114,10 +119,50 @@ def check_connect_mark(family, host, before, after, description, iterations=1):
     return True
 
 
+def check_datagram_connect_mark(
+    family, host, before, after, description, iterations=1
+):
+    server = None
+    try:
+        server = socket.socket(family, socket.SOCK_DGRAM)
+        server.bind((host, 0))
+    except OSError as exc:
+        if server is not None:
+            server.close()
+        if family == socket.AF_INET6 and exc.errno in {
+            errno.EAFNOSUPPORT,
+            errno.EADDRNOTAVAIL,
+            errno.EPROTONOSUPPORT,
+        }:
+            runtime.joinpath("ipv6-skipped").write_text(str(exc))
+            return False
+        raise SystemExit(f"cannot create {description} endpoint: {exc}") from exc
+    try:
+        for iteration in range(iterations):
+            client = socket.socket(family, socket.SOCK_DGRAM)
+            try:
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, before)
+                client.connect(server.getsockname())
+                observed = client.getsockopt(socket.SOL_SOCKET, socket.SO_MARK)
+                if observed != after:
+                    raise SystemExit(
+                        f"{description} mark after connect iteration {iteration} "
+                        f"was {observed:#010x}; expected {after:#010x}"
+                    )
+            finally:
+                client.close()
+    finally:
+        server.close()
+    return True
+
+
 wait_file("check-marked")
 wait_mark(existing, expected, "existing socket mark")
+wait_mark(existing_udp, expected, "existing UDP socket mark")
 created_after_match = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+created_udp_after_match = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 wait_mark(created_after_match, expected, "new socket mark")
+wait_mark(created_udp_after_match, expected, "new UDP socket mark")
 
 # Clear SO_MARK after socket creation. Only a connect hook can repair it before
 # the first route lookup. Repeat this to cover regressions in both address
@@ -130,6 +175,14 @@ check_connect_mark(
     "IPv4 connect-time repair",
     iterations=100,
 )
+check_datagram_connect_mark(
+    socket.AF_INET,
+    "127.0.0.1",
+    0,
+    expected,
+    "IPv4 UDP connect-time repair",
+    iterations=20,
+)
 if check_connect_mark(
     socket.AF_INET6,
     "::1",
@@ -138,12 +191,28 @@ if check_connect_mark(
     "IPv6 connect-time repair",
     iterations=100,
 ):
+    ipv6_tcp = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    ipv6_udp = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    wait_mark(ipv6_tcp, expected, "new IPv6 TCP socket mark")
+    wait_mark(ipv6_udp, expected, "new IPv6 UDP socket mark")
+    ipv6_tcp.close()
+    ipv6_udp.close()
+    check_datagram_connect_mark(
+        socket.AF_INET6,
+        "::1",
+        0,
+        expected,
+        "IPv6 UDP connect-time repair",
+        iterations=20,
+    )
     runtime.joinpath("ipv6-checked").touch()
 runtime.joinpath("marked").touch()
 
 wait_file("check-cleared")
 wait_mark(existing, 0, "cleared existing socket mark")
+wait_mark(existing_udp, 0, "cleared existing UDP socket mark")
 wait_mark(created_after_match, 0, "cleared new socket mark")
+wait_mark(created_udp_after_match, 0, "cleared new UDP socket mark")
 
 # A live process-map entry with HasMark=false must not change or reject a
 # connection.
@@ -153,6 +222,13 @@ check_connect_mark(
     0,
     0,
     "unmarked IPv4 connect",
+)
+check_datagram_connect_mark(
+    socket.AF_INET,
+    "127.0.0.1",
+    0,
+    0,
+    "unmarked IPv4 UDP connect",
 )
 runtime.joinpath("cleared").touch()
 
@@ -168,6 +244,13 @@ check_connect_mark(
     sentinel,
     "zero-derived IPv4 connect",
 )
+check_datagram_connect_mark(
+    socket.AF_INET,
+    "127.0.0.1",
+    sentinel,
+    sentinel,
+    "zero-derived IPv4 UDP connect",
+)
 if runtime.joinpath("ipv6-checked").exists():
     check_connect_mark(
         socket.AF_INET6,
@@ -176,6 +259,13 @@ if runtime.joinpath("ipv6-checked").exists():
         sentinel,
         "zero-derived IPv6 connect",
     )
+    check_datagram_connect_mark(
+        socket.AF_INET6,
+        "::1",
+        sentinel,
+        sentinel,
+        "zero-derived IPv6 UDP connect",
+    )
 runtime.joinpath("zero-derived").touch()
 PY
 target_pid="$!"
@@ -183,7 +273,11 @@ target_pid="$!"
 retry "$E2E_TIMEOUT" "socket probe readiness" test -f "$E2E_RUNTIME/ready" \
 	|| fail "socket probe did not become ready"
 
-update_rules '{"rule_comm":"^e2e-fwmark$","rule_cmd":"","rule_exe":"","rule_ppid":"","mark_priority":5,"mark_value":1885667170394832896}' >/dev/null
+update_rules '{"rule_comm":"e2e-fwmark","rule_cmd":"","rule_exe":"","rule_ppid":"","mark_priority":5,"mark_value":1885667170394832896}' >/dev/null
+state | jq -e '
+	.dynamic.kernel_policy.mode == "userspace-only"
+	and (.dynamic.kernel_policy.fallback_rules | length) > 0
+' >/dev/null || fail "fallback comm policy was not reported as userspace-only"
 retry "$E2E_TIMEOUT" "fwmark process entry" \
 	process_value_matches "$target_pid" true 1885667170394832896 true \
 	|| fail "socket probe did not receive a process mark"
@@ -196,6 +290,14 @@ else
 	test -f "$E2E_RUNTIME/ipv6-checked" \
 		|| fail "IPv6 connect-time repair did not run"
 fi
+python3 - <<'PY' || fail "an unrelated process received a socket mark"
+import socket
+
+for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+    with socket.socket(socket.AF_INET, kind) as probe:
+        if probe.getsockopt(socket.SOL_SOCKET, socket.SO_MARK) != 0:
+            raise SystemExit(1)
+PY
 
 update_rules '{"rule_comm":"","rule_cmd":"","rule_exe":"","rule_ppid":"","mark_priority":5,"mark_value":1885667170394832896}' >/dev/null
 retry "$E2E_TIMEOUT" "fwmark process entry removal" \

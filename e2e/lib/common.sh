@@ -10,6 +10,23 @@ set -euo pipefail
 daemon_pid=""
 E2E_TIMEOUT="${E2E_TIMEOUT:-20}"
 
+record_state_evidence() {
+	local phase="$1"
+	local snapshot
+
+	snapshot="$(state)" || return 1
+	jq -c \
+		--arg case "$E2E_CASE" \
+		--arg phase "$phase" \
+		'{case: $case, phase: $phase,
+		  policy_mode: .dynamic.kernel_policy.mode,
+		  rule_generation: .dynamic.generation,
+		  kernel_rule_count: .dynamic.kernel_policy.rule_count,
+		  promoted_comm: .dynamic.kernel_policy.promoted_comm,
+		  fallback_rules: .dynamic.kernel_policy.fallback_rules}' \
+		<<<"$snapshot" | tee -a "$E2E_EVIDENCE_FILE" >&2
+}
+
 log() {
 	printf '[%s] %s\n' "$E2E_CASE" "$*" >&2
 }
@@ -80,11 +97,14 @@ start_daemon() {
 	daemon_pid="$!"
 	retry "$E2E_TIMEOUT" "pmark control API" api_is_ready \
 		|| fail "pmark control API did not become ready"
+	record_state_evidence start \
+		|| fail "could not record the initial policy evidence"
 }
 
 stop_daemon() {
 	if [[ -n "${daemon_pid:-}" ]]; then
 		if kill -0 "$daemon_pid" 2>/dev/null; then
+			record_state_evidence stop || true
 			log "stopping pmark"
 			kill "$daemon_pid" 2>/dev/null || true
 			local deadline=$((SECONDS + 10))
@@ -146,4 +166,5 @@ update_rules() {
 		-H 'Content-Type: application/json' \
 		--data "$json" \
 		"$E2E_HTTP_URL/rules"
+	record_state_evidence update
 }

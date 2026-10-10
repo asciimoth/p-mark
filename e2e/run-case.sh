@@ -20,9 +20,12 @@ export E2E_CASE_DIR="$E2E_RUNTIME/case"
 export E2E_PIN_PATH="/sys/fs/bpf/pmark-e2e-$case_name"
 export E2E_DAEMON_LOG="$E2E_RUNTIME/pmark.log"
 export E2E_HTTP_URL="http://127.0.0.1:18050"
+export E2E_EVIDENCE_FILE="${E2E_EVIDENCE_DIR:-$E2E_RUNTIME}/$case_name.jsonl"
 
 rm -rf "$E2E_RUNTIME"
 mkdir -p "$E2E_CASE_DIR"
+mkdir -p "$(dirname "$E2E_EVIDENCE_FILE")"
+: >"$E2E_EVIDENCE_FILE"
 cp -a "$source_dir"/. "$E2E_CASE_DIR"/
 cd "$E2E_CASE_DIR"
 

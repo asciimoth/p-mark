@@ -1,0 +1,3 @@
+::sysinit:/e2e/guest/boot.sh
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r

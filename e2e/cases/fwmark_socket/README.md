@@ -6,11 +6,14 @@ Assertions:
 
 - a socket opened before a process matches a rule starts unmarked;
 - adding a matching rule reconciles the already-open socket;
+- the reconciliation rule is reported as `userspace-only` fallback policy;
 - sockets created after the update get the fwmark from the eBPF hook;
+- socket creation and connect repair cover TCP and UDP over IPv4 and IPv6;
 - clearing `SO_MARK` before IPv4 `connect()` repairs the mark 100 times;
 - clearing `SO_MARK` before IPv6 `connect()` repairs the mark 100 times when
   IPv6 loopback is available;
 - removing the rule clears both existing socket marks;
 - an unmarked process can connect and keeps mark zero; and
+- an unrelated process creates unmarked TCP and UDP sockets; and
 - a process mark that derives fwmark zero does not change or reject a marked
   socket during `connect()`.

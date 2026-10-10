@@ -206,9 +206,18 @@ Run the privileged Docker end-to-end suite:
 just test-e2e
 ```
 
+Run the same focused marking gate in a disposable VM:
+
+```sh
+just test-e2e-guest
+```
+
 The end-to-end tests use eBPF, bpffs, the host PID namespace, and cgroup socket
 hooks. See [`e2e/README.md`](./e2e/README.md) for the host requirements, case
 layout, image cache, and coverage options.
+The guest command does not share the host PID namespace, network, or BPF
+objects. See [`e2e/guest/README.md`](./e2e/guest/README.md) for its QEMU and
+kernel requirements and its saved test evidence.
 
 ## Library Usage
 Note: You can find more marks usage examples in [ebpf-test](https://github.com/asciimoth/ebpf-test)

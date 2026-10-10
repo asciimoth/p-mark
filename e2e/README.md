@@ -22,6 +22,16 @@ must read the same identities from `/proc`. Each case uses a separate bpffs pin
 directory and removes it on exit. Run this suite only on a disposable test host
 that permits privileged Docker containers.
 
+For an isolated VM that does not use the host PID namespace, host network, or
+host BPF objects, run:
+
+```sh
+just test-e2e-guest
+```
+
+See [`guest/README.md`](./guest/README.md) for prerequisites, case selection,
+timeouts, isolation, and saved evidence.
+
 The runner uses one case at a time by default. Set `E2E_JOBS` to run more cases
 in parallel. Each case's output stays grouped, and the runner reports all case
 failures after the active cases finish.
@@ -53,4 +63,3 @@ Each case lives in `e2e/cases/<case-name>/` and contains:
 The harness copies each case to an isolated directory under `/tmp` before it
 runs the case. The case can write temporary files in `$E2E_RUNTIME` without
 changing the source tree.
-

@@ -2,5 +2,6 @@
 .direnv
 dist
 e2e/coverage
+e2e/.guest-cache
+e2e/artifacts
 pmark
-
